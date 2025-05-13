@@ -18,5 +18,10 @@ class ContentItem(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     # Add other content-related fields here (e.g., author, category)
 
+class Link(models.Model):
+    title = models.CharField(max_length=200)
+    url = models.URLField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
     def __str__(self):
         return self.title
