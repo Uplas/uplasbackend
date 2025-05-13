@@ -1,8 +1,6 @@
 import os
-import sys
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(BASE_DIR)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DJANGO_APPS_DIR = os.path.join(PROJECT_ROOT, 'core')
 
 INSTALLED_APPS = [
     'core',
@@ -15,6 +13,4 @@ INSTALLED_APPS = [
 ]
 
 
-import os
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DJANGO_APPS_DIR = os.path.join(PROJECT_ROOT, 'core')
+
