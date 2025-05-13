@@ -19,8 +19,9 @@ class ContentItem(models.Model):
     # Add other content-related fields here (e.g., author, category)
 
 class Link(models.Model):
-    title = models.CharField(max_length=200)
+    title = models.CharField(max_length=255)
     url = models.URLField()
+    submitted_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
