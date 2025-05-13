@@ -5,5 +5,5 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'core',  # <--- Make absolutely sure this line is here and correct
+    'backend.core',  # Try using the path relative to the project root
 ]
