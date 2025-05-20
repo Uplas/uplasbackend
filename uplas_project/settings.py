@@ -112,3 +112,19 @@ DATABASES = {
 # EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER')
 # EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD')
 # DEFAULT_FROM_EMAIL = 'Uplas Support <support@uplas.com>'
+
+
+# uplas_backend/uplas_project/settings.py
+
+# Add 'apps.payments' to INSTALLED_APPS
+INSTALLED_APPS = [
+    # ... other apps
+    'apps.payments',
+    # ...
+]
+
+# Stripe API Keys (use environment variables)
+STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY')
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY')
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET_PAYMENTS') # Specific webhook secret for payment events
+# You might have multiple webhook endpoints with different secrets for different event types
