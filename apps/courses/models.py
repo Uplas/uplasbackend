@@ -1,23 +1,30 @@
-
 from django.db import models
 from django.conf import settings
 from django.utils.translation import gettext_lazy as _
 from django.utils.text import slugify
+from django.utils import timezone # Ensure timezone is imported
 import uuid
 
-# Re-using User model from the users app
-# from apps.users.models import User # Not needed directly, settings.AUTH_USER_MODEL is used
+# Using choices from settings if defined globally, otherwise define here or in a choices.py
+# For simplicity, if CURRENCY_CHOICES is defined in settings.users, we assume it's accessible
+# via settings.CURRENCY_CHOICES. If not, define it here.
+# from apps.users.models import CURRENCY_CHOICES # Or define locally if not in settings
+
+# Local CURRENCY_CHOICES if not globally in settings from users app
+# (Assuming they are already defined in settings.py as per users app setup)
+# CURRENCY_CHOICES = [
+#     ('USD', _('USD - US Dollar')),
+#     ('EUR', _('EUR - Euro')),
+#     # ... add more if needed
+# ]
+
 
 class CourseCategory(models.Model):
-    """
-    Categories for courses, e.g., "AI Fundamentals", "Machine Learning", "Data Science".
-    
-    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(_("Category Name"), max_length=150, unique=True)
     slug = models.SlugField(_("Slug"), max_length=170, unique=True, blank=True, help_text=_("URL-friendly identifier"))
     description = models.TextField(_("Description"), blank=True, null=True)
-    icon_url = models.URLField(_("Icon URL"), blank=True, null=True) # Optional icon for the category
+    icon_url = models.URLField(_("Icon URL"), blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -35,10 +42,6 @@ class CourseCategory(models.Model):
         return self.name
 
 class Course(models.Model):
-    """
-    Represents a course offered on the platform.
-    
-    """
     DIFFICULTY_CHOICES = [
         ('beginner', _('Beginner')),
         ('intermediate', _('Intermediate')),
@@ -50,24 +53,22 @@ class Course(models.Model):
     title = models.CharField(_("Course Title"), max_length=255)
     slug = models.SlugField(_("Slug"), max_length=270, unique=True, blank=True, help_text=_("URL-friendly identifier for the course"))
     subtitle = models.CharField(_("Subtitle/Short Description"), max_length=255, blank=True, null=True)
-    description_html = models.TextField(_("Detailed Description (HTML format)")) # Content from frontend editor 
+    description_html = models.TextField(_("Detailed Description (HTML format)"))
     category = models.ForeignKey(CourseCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='courses')
     instructor = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL, # Or PROTECT if an instructor must exist
-        null=True, # Can be a platform-authored course without a specific user instructor
+        on_delete=models.SET_NULL,
+        null=True,
         blank=True,
         related_name='courses_taught',
         help_text=_("Lead instructor or author")
     )
-    # instructor_name & instructor_bio from guide can be denormalized or fetched from instructor's profile 
-    # For simplicity, let's assume we can fetch from User model or a dedicated InstructorProfile if needed
     
-    price = models.DecimalField(_("Price"), max_digits=10, decimal_places=2, default=0.00) # 0.00 for free courses
+    price = models.DecimalField(_("Price"), max_digits=10, decimal_places=2, default=0.00)
     currency = models.CharField(
         _("Currency"),
         max_length=3,
-        choices=settings.CURRENCY_CHOICES, # Use choices from project settings
+        choices=settings.CURRENCY_CHOICES if hasattr(settings, 'CURRENCY_CHOICES') else [('USD', 'USD')], # Fallback if not in settings
         default='USD'
     )
     
@@ -89,31 +90,31 @@ class Course(models.Model):
     )
     
     learning_objectives = models.JSONField(
-        _("What You'll Learn / Learning Objectives"), # Stored as a list of strings
+        _("What You'll Learn / Learning Objectives"),
         default=list,
         blank=True,
         help_text=_("List of key takeaways or skills gained.")
     )
     requirements = models.JSONField(
-        _("Prerequisites/Requirements"), # Stored as a list of strings
+        _("Prerequisites/Requirements"),
         default=list,
         blank=True,
         help_text=_("List of prerequisites or necessary tools/knowledge.")
     )
     target_audience = models.JSONField(
-        _("Who is this course for?"), # Stored as a list of strings
+        _("Who is this course for?"),
         default=list,
         blank=True
     )
 
     is_published = models.BooleanField(_("Published"), default=False, help_text=_("Whether the course is live and visible to users"))
     published_date = models.DateTimeField(_("Published Date"), null=True, blank=True)
+    
+    average_rating = models.FloatField(_("Average Rating"), default=0.0)
+    total_enrollments = models.PositiveIntegerField(_("Total Enrollments"), default=0)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-
-    # For average rating - can be calculated dynamically or stored and updated via signals/tasks
-    average_rating = models.FloatField(_("Average Rating"), default=0.0)
-    total_enrollments = models.PositiveIntegerField(_("Total Enrollments"), default=0) # Denormalized count
 
     class Meta:
         verbose_name = _("Course")
@@ -123,14 +124,12 @@ class Course(models.Model):
     def save(self, *args, **kwargs):
         if not self.slug:
             self.slug = slugify(self.title)
-            # Ensure uniqueness if multiple courses might have similar titles
             original_slug = self.slug
-            queryset = Course.objects.filter(slug=original_slug).exists()
             counter = 1
-            while queryset:
+            # Ensure slug uniqueness if creating
+            while Course.objects.filter(slug=self.slug).exclude(pk=self.pk).exists(): # Exclude self if updating
                 self.slug = f"{original_slug}-{counter}"
                 counter += 1
-                queryset = Course.objects.filter(slug=self.slug).exists()
         if self.is_published and not self.published_date:
             self.published_date = timezone.now()
         super().save(*args, **kwargs)
@@ -139,10 +138,6 @@ class Course(models.Model):
         return self.title
 
 class Module(models.Model):
-    """
-    A module within a course, e.g., "Module 1: Introduction to Python".
-    
-    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='modules')
     title = models.CharField(_("Module Title"), max_length=255)
@@ -155,28 +150,24 @@ class Module(models.Model):
         verbose_name = _("Module")
         verbose_name_plural = _("Modules")
         ordering = ['course', 'order', 'title']
-        unique_together = ('course', 'order') # Ensure order is unique per course
+        unique_together = ('course', 'order')
 
     def __str__(self):
         return f"{self.course.title} - Module {self.order}: {self.title}"
 
 class Topic(models.Model):
-    """
-    A specific topic or lesson within a module, e.g., "Variables and Data Types".
-    
-    """
     CONTENT_TYPE_CHOICES = [
-        ('text', _('Text Article')), # Rich text content 
-        ('video', _('Video Lesson')), # Link to video content (URL)
-        ('quiz', _('Quiz/Assessment')), # 
-        ('assignment', _('Coding Assignment')), # Link to an assignment or embedded instructions
-        ('external_resource', _('External Resource')), # Link to docs, articles, etc.
+        ('text', _('Text Article')),
+        ('video', _('Video Lesson')),
+        ('quiz', _('Quiz/Assessment')),
+        ('assignment', _('Coding Assignment')), # Simplified: details in text_content_html or external link
+        ('external_resource', _('External Resource')),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     module = models.ForeignKey(Module, on_delete=models.CASCADE, related_name='topics')
     title = models.CharField(_("Topic Title"), max_length=255)
-    slug = models.SlugField(_("Slug"), max_length=270, unique=True, blank=True, help_text=_("URL-friendly identifier for the topic"))
+    slug = models.SlugField(_("Slug"), max_length=300, unique=True, blank=True, help_text=_("URL-friendly identifier for the topic")) # Increased length
     order = models.PositiveIntegerField(_("Topic Order"), default=0, help_text=_("Order of the topic within the module"))
     
     content_type = models.CharField(
@@ -185,12 +176,8 @@ class Topic(models.Model):
         choices=CONTENT_TYPE_CHOICES,
         default='text'
     )
-    # text_content_html: content from frontend editor for 'text' type 
-    text_content_html = models.TextField(_("Text Content (HTML)"), blank=True, null=True, help_text=_("Used if content_type is 'text'"))
+    text_content_html = models.TextField(_("Text Content (HTML)"), blank=True, null=True, help_text=_("Used if content_type is 'text', 'assignment'"))
     video_url = models.URLField(_("Video URL"), blank=True, null=True, help_text=_("Used if content_type is 'video'"))
-    # For 'quiz' and 'assignment', we might link to separate models or store JSON structure here.
-    # quiz_data_json = models.JSONField(_("Quiz Data (JSON)"), blank=True, null=True, help_text=_("Structure for quiz questions, used if content_type is 'quiz'"))
-    # assignment_details_html = models.TextField(_("Assignment Details (HTML)"), blank=True, null=True, help_text=_("Used if content_type is 'assignment'"))
     external_resource_url = models.URLField(_("External Resource URL"), blank=True, null=True, help_text=_("Used if content_type is 'external_resource'"))
     
     estimated_duration_minutes = models.PositiveIntegerField(
@@ -204,10 +191,9 @@ class Topic(models.Model):
         help_text=_("Can users view this topic before enrolling/purchasing?")
     )
 
-    # For AI interactions:
     supports_ai_tutor = models.BooleanField(_("Supports AI Tutor"), default=True)
-    supports_tts = models.BooleanField(_("Supports Text-to-Speech"), default=True) # For text-based content
-    supports_ttv = models.BooleanField(_("Supports Text-to-Video"), default=False) # If this topic is suitable for AI video generation
+    supports_tts = models.BooleanField(_("Supports Text-to-Speech"), default=True)
+    supports_ttv = models.BooleanField(_("Supports Text-to-Video"), default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -215,27 +201,30 @@ class Topic(models.Model):
     class Meta:
         verbose_name = _("Topic")
         verbose_name_plural = _("Topics")
-        ordering = ['module', 'order', 'title']
-        unique_together = ('module', 'order') # Ensure order is unique per module
+        ordering = ['module__course__title', 'module__order', 'order', 'title'] # Order globally then locally
+        unique_together = ('module', 'order')
 
     def save(self, *args, **kwargs):
         if not self.slug:
             base_slug = slugify(self.title)
-            self.slug = f"{self.module.course.slug}-{self.module.id}-{base_slug}" # Ensure more global uniqueness for slugs
+            # Ensure slug is unique, possibly by appending module/course identifiers or random chars if needed for global uniqueness
+            module_prefix = slugify(self.module.title)[:20]
+            course_prefix = slugify(self.module.course.title)[:20]
+            self.slug = f"{course_prefix}-{module_prefix}-{base_slug}"
+            original_slug = self.slug
+            counter = 1
+            while Topic.objects.filter(slug=self.slug).exclude(pk=self.pk).exists():
+                self.slug = f"{original_slug}-{counter}"
+                counter += 1
         super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.module.title} - Topic {self.order}: {self.title}"
 
-
 class Quiz(models.Model):
-    """
-    Represents a quiz associated with a Topic.
-    (Implied by content_type 'quiz')
-    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     topic = models.OneToOneField(Topic, on_delete=models.CASCADE, related_name='quiz_details', limit_choices_to={'content_type': 'quiz'})
-    title = models.CharField(_("Quiz Title"), max_length=255, blank=True) # Can inherit from topic title
+    title = models.CharField(_("Quiz Title"), max_length=255, blank=True)
     description = models.TextField(_("Quiz Description/Instructions"), blank=True, null=True)
     pass_mark_percentage = models.PositiveSmallIntegerField(
         _("Pass Mark Percentage"),
@@ -246,24 +235,24 @@ class Quiz(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    class Meta:
+        verbose_name = _("Quiz")
+        verbose_name_plural = _("Quizzes")
+
     def save(self, *args, **kwargs):
         if not self.title and self.topic:
-            self.title = self.topic.title
+            self.title = f"Quiz for: {self.topic.title}"
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"Quiz for: {self.topic.title}"
+        return self.title or f"Quiz for Topic ID: {self.topic_id}"
 
 class Question(models.Model):
-    """
-    A question within a Quiz.
-    """
     QUESTION_TYPE_CHOICES = [
-        ('multiple_choice', _('Multiple Choice')),
-        ('single_choice', _('Single Choice (Radio)')),
+        ('multiple_choice', _('Multiple Choice')), # Multiple correct options possible (checkboxes)
+        ('single_choice', _('Single Choice')),   # Only one correct option (radio buttons)
         ('true_false', _('True/False')),
         ('short_answer', _('Short Answer (Text Input)')),
-        # ('fill_in_the_blanks', _('Fill in the Blanks')),
     ]
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     quiz = models.ForeignKey(Quiz, on_delete=models.CASCADE, related_name='questions')
@@ -275,21 +264,20 @@ class Question(models.Model):
         default='single_choice'
     )
     order = models.PositiveIntegerField(_("Question Order"), default=0)
-    explanation = models.TextField(_("Explanation for Answer"), blank=True, null=True, help_text=_("Shown after attempt"))
+    explanation = models.TextField(_("Explanation for Answer"), blank=True, null=True, help_text=_("Shown after attempt or review"))
     points = models.PositiveSmallIntegerField(_("Points"), default=1)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
+        verbose_name = _("Question")
+        verbose_name_plural = _("Questions")
         ordering = ['quiz', 'order']
 
     def __str__(self):
         return f"Q{self.order}: {self.text[:50]}... ({self.quiz.title})"
 
 class AnswerOption(models.Model):
-    """
-    An answer option for a multiple-choice or single-choice Question.
-    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='options')
     text = models.CharField(_("Option Text"), max_length=500)
@@ -298,46 +286,39 @@ class AnswerOption(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['question', 'id'] # Randomize order in serializer/view if needed for display
+        verbose_name = _("Answer Option")
+        verbose_name_plural = _("Answer Options")
+        ordering = ['question', 'id'] # Or 'question', '?' to randomize display order
 
     def __str__(self):
         return f"{self.text} (Correct: {self.is_correct})"
 
-
-# User Progress and Interaction Models
-
 class UserCourseEnrollment(models.Model):
-    """
-    Tracks user enrollment in courses.
-    (Conceptualized as UserCourseProgress in the guide, but enrollment is the first step)
-    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='course_enrollments')
     course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='enrollments')
     enrolled_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(_("Completed At"), null=True, blank=True)
-    # progress_percentage: calculated based on completed topics 
-    # last_accessed_topic: ForeignKey to Topic, can be added 
     
-    # Denormalized progress for quick lookups
     progress_percentage = models.PositiveSmallIntegerField(_("Progress Percentage"), default=0)
-    last_accessed_topic = models.ForeignKey(Topic, on_delete=models.SET_NULL, null=True, blank=True)
+    last_accessed_topic = models.ForeignKey('Topic', on_delete=models.SET_NULL, null=True, blank=True, related_name='last_accessed_by_enrollments')
 
     class Meta:
         verbose_name = _("User Course Enrollment")
         verbose_name_plural = _("User Course Enrollments")
-        unique_together = ('user', 'course') # User can only enroll once in a course
+        unique_together = ('user', 'course')
         ordering = ['-enrolled_at']
 
     def __str__(self):
         return f"{self.user.username} enrolled in {self.course.title}"
 
     def update_progress(self):
-        """Calculates and updates the progress percentage for this enrollment."""
-        total_topics = Topic.objects.filter(module__course=self.course).count()
-        if total_topics == 0:
-            self.progress_percentage = 100 if self.completed_at else 0 # No topics means instantly complete or 0
-            self.save()
+        total_topics_count = Topic.objects.filter(module__course=self.course).count()
+        if total_topics_count == 0:
+            self.progress_percentage = 100 if not self.course.modules.exists() else 0
+            if self.progress_percentage == 100 and not self.completed_at :
+                 self.completed_at = timezone.now()
+            self.save(update_fields=['progress_percentage', 'completed_at'])
             return
 
         completed_topics_count = UserTopicAttempt.objects.filter(
@@ -345,68 +326,61 @@ class UserCourseEnrollment(models.Model):
             is_completed=True
         ).count()
         
-        self.progress_percentage = int((completed_topics_count / total_topics) * 100)
+        self.progress_percentage = int((completed_topics_count / total_topics_count) * 100)
         
         if self.progress_percentage >= 100 and not self.completed_at:
             self.completed_at = timezone.now()
-            # Potentially award certificate or XP here via a signal or task
+            # TODO: Consider emitting a signal for course completion (e.g., for certificates, XP)
             
-        self.save()
+        self.save(update_fields=['progress_percentage', 'completed_at'])
 
 class UserTopicAttempt(models.Model):
-    """
-    Tracks a user's attempt and status for a specific topic (lesson, quiz, etc.).
-    
-    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     enrollment = models.ForeignKey(UserCourseEnrollment, on_delete=models.CASCADE, related_name='topic_attempts')
     topic = models.ForeignKey(Topic, on_delete=models.CASCADE, related_name='user_attempts')
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='topic_attempts_direct') # Direct link for easier querying per user
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='topic_attempts_direct')
 
     started_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(_("Completed At"), null=True, blank=True)
     is_completed = models.BooleanField(_("Is Completed"), default=False)
     
-    # For quizzes/assignments:
-    score = models.FloatField(_("Score (0.0 to 1.0 or points)"), null=True, blank=True)
-    passed = models.BooleanField(_("Passed"), null=True, blank=True) # Relevant for quizzes/assignments
+    score = models.FloatField(_("Score (percentage for quizzes)"), null=True, blank=True) # For quizzes, 0-100
+    passed = models.BooleanField(_("Passed (quiz/assignment)"), null=True, blank=True)
     
-    # answer_history_json: For quiz answers or assignment submissions 
-    # Could store a list of dicts: {"question_id": "...", "answer_given": "...", "is_correct": ...}
-    answer_history_json = models.JSONField(_("Answer History (JSON)"), null=True, blank=True)
+    answer_history_json = models.JSONField(_("Answer History (JSON for Quizzes)"), null=True, blank=True)
     
     last_accessed_at = models.DateTimeField(auto_now=True)
+
+    # Store original completion status to check if it changed for progress update
+    _original_is_completed = None
 
     class Meta:
         verbose_name = _("User Topic Attempt")
         verbose_name_plural = _("User Topic Attempts")
-        unique_together = ('enrollment', 'topic') # One attempt record per topic per enrollment
+        unique_together = ('enrollment', 'topic')
         ordering = ['enrollment', 'topic__module__order', 'topic__order']
-
-    def save(self, *args, **kwargs):
-        # Ensure user matches enrollment.user
-        if self.enrollment and self.user != self.enrollment.user:
-             raise ValueError("UserTopicAttempt user must match enrollment user.")
-        
-        super().save(*args, **kwargs)
-        if self._state.adding or self.is_completed != self.__original_is_completed: # If new or completion status changed
-            self.enrollment.update_progress() # Recalculate course progress
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.__original_is_completed = self.is_completed
+        self._original_is_completed = self.is_completed
 
+    def save(self, *args, **kwargs):
+        if self.enrollment and self.user_id != self.enrollment.user_id: # Ensure user consistency
+             raise ValueError("UserTopicAttempt user must match enrollment user.")
+        
+        is_status_changed = self.is_completed != self._original_is_completed
+        super().save(*args, **kwargs)
+        
+        if is_status_changed or self._state.adding: # If status changed or new attempt
+            if self.enrollment:
+                self.enrollment.update_progress()
+        self._original_is_completed = self.is_completed # Update original status after save
 
     def __str__(self):
-        return f"{self.enrollment.user.username} - {self.topic.title} (Completed: {self.is_completed})"
-
+        return f"{self.user.username} - {self.topic.title} (Completed: {self.is_completed})"
 
 class Review(models.Model):
-    """
-    User reviews and ratings for courses.
-    
-    """
-    RATING_CHOICES = [(i, str(i)) for i in range(1, 6)] # 1 to 5 stars
+    RATING_CHOICES = [(i, str(i)) for i in range(1, 6)]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='reviews')
@@ -419,26 +393,32 @@ class Review(models.Model):
     class Meta:
         verbose_name = _("Review")
         verbose_name_plural = _("Reviews")
-        unique_together = ('course', 'user') # User can only review a course once
+        unique_together = ('course', 'user')
         ordering = ['-created_at']
 
     def __str__(self):
         return f"Review for {self.course.title} by {self.user.username} ({self.rating} stars)"
 
-    def save(self, *args, **kwargs):
-        super().save(*args, **kwargs)
-        # Update average rating on the course (could be done via a signal for efficiency)
-        self.course.average_rating = self.course.reviews.aggregate(models.Avg('rating'))['rating__avg'] or 0.0
-        self.course.save(update_fields=['average_rating'])
-
-from django.db.models.signals import post_delete
+# Signals for updating denormalized counts/ratings
+from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
 
+@receiver(post_save, sender=Review)
 @receiver(post_delete, sender=Review)
-def update_course_rating_on_delete(sender, instance, **kwargs):
-    if instance.course:
-        instance.course.average_rating = instance.course.reviews.aggregate(models.Avg('rating'))['rating__avg'] or 0.0
-        instance.course.save(update_fields=['average_rating'])
+def update_course_average_rating(sender, instance, **kwargs):
+    course = instance.course
+    # Recalculate average rating
+    reviews = Review.objects.filter(course=course)
+    if reviews.exists():
+        avg_rating = reviews.aggregate(models.Avg('rating'))['rating__avg']
+        course.average_rating = round(avg_rating, 2) if avg_rating is not None else 0.0
+    else:
+        course.average_rating = 0.0
+    course.save(update_fields=['average_rating'])
 
-# Import timezone utility
-from django.utils import timezone
+@receiver(post_save, sender=UserCourseEnrollment)
+@receiver(post_delete, sender=UserCourseEnrollment)
+def update_course_total_enrollments(sender, instance, **kwargs):
+    course = instance.course
+    course.total_enrollments = UserCourseEnrollment.objects.filter(course=course).count()
+    course.save(update_fields=['total_enrollments'])
