@@ -7,15 +7,24 @@ from .views import (
 
 router = DefaultRouter()
 router.register(r'plans', SubscriptionPlanViewSet, basename='subscriptionplan')
-router.register(r'subscriptions', UserSubscriptionViewSet, basename='usersubscription') # For user's own sub
-router.register(r'transactions', TransactionViewSet, basename='transaction') # For user's own transactions
+# UserSubscriptionViewSet is for the current user's single subscription.
+# No need to register with router if we only expose the list (detail of one) action.
+# If we had /api/payments/subscriptions/{id}/ for admins, then register.
+# For now, we'll map it directly for the current user.
+router.register(r'transactions', TransactionViewSet, basename='transaction')
 
 app_name = 'payments'
 
+# Custom mapping for UserSubscription as it's a singular resource for the current user.
+user_subscription_actions = UserSubscriptionViewSet.as_view({
+    'get': 'list', # 'list' action in our view returns the single subscription or 404
+    'post': 'cancel_my_subscription' # Custom action mapped via @action(detail=False)
+})
+
+
 urlpatterns = [
     path('', include(router.urls)),
+    path('my-subscription/', user_subscription_actions, name='my-subscription-detail'), # GET for detail, POST for cancel
     path('create-checkout-session/', CreateCheckoutSessionView.as_view(), name='create-checkout-session'),
     path('stripe-webhook/', StripeWebhookView.as_view(), name='stripe-webhook'),
-    # Potentially add an endpoint for Stripe Billing Portal session creation
-    # path('create-billing-portal-session/', CreateBillingPortalSessionView.as_view(), name='create-billing-portal'),
 ]
