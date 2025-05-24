@@ -1,240 +1,261 @@
 from django.test import TestCase
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from django.utils.text import slugify
-from rest_framework.test import APIRequestFactory # For providing request context
+from django.contrib.contenttypes.models import ContentType # For GenericRelation tests
 
-from ..models import BlogCategory, BlogPost, BlogComment, Author, Tag
-from ..serializers import (
-    BlogCategorySerializer, BlogPostSerializer, BlogCommentSerializer,
-    AuthorSerializer, BasicUserSerializerForBlog, BasicTagSerializerForBlog
+from rest_framework.test import APIRequestFactory # For providing request context
+from rest_framework.exceptions import ValidationError
+
+from apps.blog.models import (
+    BlogCategory, BlogPostTag, BlogPost, BlogComment
 )
+from apps.blog.serializers import (
+    BlogCategorySerializer, BlogPostTagSerializer,
+    BlogPostListSerializer, BlogPostDetailSerializer,
+    BlogCommentSerializer, SimpleUserSerializer # Ensure SimpleUserSerializer is defined or imported
+)
+# Assuming a Like model exists for testing SerializerMethodFields, e.g., in community
+# from apps.community.models import Like
 
 User = get_user_model()
 
-class BlogCategorySerializerTests(TestCase):
-    def test_category_serializer_output(self):
-        category = BlogCategory.objects.create(name="Product Updates", display_order=0)
-        # Simulate annotation if viewset provides it
-        setattr(category, 'posts_count', 3)
-        serializer = BlogCategorySerializer(category)
-        data = serializer.data
-        self.assertEqual(data['name'], "Product Updates")
-        self.assertEqual(data['slug'], slugify("Product Updates"))
-        self.assertEqual(data['posts_count'], 3)
+# Test Data Setup Mixin (adapted for serializer tests)
+class BlogSerializerTestDataMixin:
+    @classmethod
+    def setUpTestData(cls):
+        cls.author_user = User.objects.create_user(
+            username='blogser_author1', email='blogser_author1@example.com',
+            password='password123', full_name='BlogSer Author One'
+        )
+        cls.commenter_user = User.objects.create_user(
+            username='blogser_commenter1', email='blogser_commenter1@example.com',
+            password='password123', full_name='BlogSer Commenter One'
+        )
+        cls.admin_user = User.objects.create_superuser( # For context where staff might be needed
+            username='blogser_admin', email='blogser_admin@example.com',
+            password='password123', full_name='BlogSer Admin'
+        )
 
-    def test_category_serializer_create(self):
-        data = {"name": "Guides", "description": "Helpful guides."}
+        cls.cat_tech = BlogCategory.objects.create(name='Tech Serializers', slug='tech-serializers')
+        cls.tag_drf = BlogPostTag.objects.create(name='DRF', slug='drf')
+        cls.tag_testing = BlogPostTag.objects.create(name='Testing', slug='testing')
+
+        cls.post_published = BlogPost.objects.create(
+            author=cls.author_user, category=cls.cat_tech,
+            title='Serializing Django Models', slug='serializing-django-models-ser',
+            excerpt='How to effectively serialize models.',
+            content_markdown='Markdown content about serializers...',
+            status='published', published_at=timezone.now()
+        )
+        cls.post_published.tags.add(cls.tag_drf, cls.tag_testing)
+
+        cls.post_draft = BlogPost.objects.create(
+            author=cls.author_user, category=cls.cat_tech,
+            title='Draft Post on Serializers', slug='draft-post-serializers-ser',
+            content_markdown='This is a draft.', status='draft'
+        )
+
+        cls.comment_on_published = BlogComment.objects.create(
+            blog_post=cls.post_published, author=cls.commenter_user,
+            content='Very useful serializer info!'
+        )
+        # post_published.comment_count should be 1 now due to signal
+
+        # For providing request context to serializers
+        cls.factory = APIRequestFactory()
+        cls.request_author = cls.factory.get('/fake-blog-endpoint')
+        cls.request_author.user = cls.author_user
+        cls.request_author.method = 'GET' # Can be changed in tests
+
+        cls.request_commenter = cls.factory.get('/fake-blog-endpoint')
+        cls.request_commenter.user = cls.commenter_user
+        cls.request_commenter.method = 'GET'
+        
+        cls.request_admin = cls.factory.get('/fake-blog-endpoint')
+        cls.request_admin.user = cls.admin_user
+        cls.request_admin.method = 'GET'
+
+        cls.request_anonymous = cls.factory.get('/fake-blog-endpoint')
+        from django.contrib.auth.models import AnonymousUser
+        cls.request_anonymous.user = AnonymousUser()
+        cls.request_anonymous.method = 'GET'
+
+
+class BlogCategorySerializerTests(BlogSerializerTestDataMixin, TestCase):
+    def test_serialization_output(self):
+        self.cat_tech.refresh_from_db() # Ensure post_count is updated by signals
+        serializer = BlogCategorySerializer(instance=self.cat_tech)
+        data = serializer.data
+        self.assertEqual(data['name'], self.cat_tech.name)
+        self.assertEqual(data['slug'], self.cat_tech.slug)
+        self.assertEqual(data['post_count'], 1) # post_published is in this category
+        self.assertIn('id', data)
+
+    def test_deserialization_create_valid_with_slug_generation(self):
+        data = {'name': 'New Category For Blog', 'description': 'A new one for testing.'}
         serializer = BlogCategorySerializer(data=data)
         self.assertTrue(serializer.is_valid(), serializer.errors)
         category = serializer.save()
-        self.assertEqual(category.name, "Guides")
+        self.assertEqual(category.name, 'New Category For Blog')
+        self.assertEqual(category.slug, slugify('New Category For Blog'))
 
-
-class AuthorSerializerTests(TestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(
-            email="blog_author_user@example.com", password="password", full_name="Blog Author User"
-        )
-        self.user.profile_picture_url = "http://example.com/user_avatar.png" # Assuming direct field on User
-        self.user.save()
-
-    def test_author_serializer_with_linked_user_override(self):
-        author_profile = Author.objects.create(
-            user=self.user,
-            display_name="Dr. Blogger",
-            bio="Blogging expert.",
-            avatar_url="http://example.com/dr_blogger.png"
-        )
-        serializer = AuthorSerializer(author_profile)
-        data = serializer.data
-        self.assertEqual(data['display_name'], "Dr. Blogger")
-        self.assertEqual(data['effective_display_name'], "Dr. Blogger")
-        self.assertEqual(data['effective_avatar_url'], "http://example.com/dr_blogger.png")
-        self.assertEqual(data['user_details']['full_name'], self.user.full_name)
-
-    def test_author_serializer_with_linked_user_no_override(self):
-        author_profile = Author.objects.create(user=self.user, display_name="") # No override display name or avatar
-        serializer = AuthorSerializer(author_profile)
-        data = serializer.data
-        self.assertEqual(data['effective_display_name'], self.user.full_name) # Falls back to user
-        self.assertEqual(data['effective_avatar_url'], self.user.profile_picture_url) # Falls back
-
-    def test_author_serializer_guest_author(self):
-        guest_author = Author.objects.create(display_name="Anonymous Contributor", bio="Writes sometimes.")
-        serializer = AuthorSerializer(guest_author)
-        data = serializer.data
-        self.assertEqual(data['display_name'], "Anonymous Contributor")
-        self.assertEqual(data['effective_display_name'], "Anonymous Contributor")
-        self.assertIsNone(data['effective_avatar_url'])
-        self.assertIsNone(data['user_details']) # No linked user
-
-    def test_author_serializer_create_with_user_link(self):
-        data = {"user": self.user.id, "display_name": "Linked Author"}
-        serializer = AuthorSerializer(data=data)
+    def test_deserialization_update_name_updates_slug_if_slug_not_provided(self):
+        data = {'name': 'Tech Serializers Updated'}
+        serializer = BlogCategorySerializer(instance=self.cat_tech, data=data, partial=True)
         self.assertTrue(serializer.is_valid(), serializer.errors)
-        author = serializer.save()
-        self.assertEqual(author.user, self.user)
-        self.assertEqual(author.display_name, "Linked Author")
+        category = serializer.save()
+        self.assertEqual(category.name, 'Tech Serializers Updated')
+        self.assertEqual(category.slug, slugify('Tech Serializers Updated'))
 
-    def test_author_serializer_create_guest(self):
-        data = {"display_name": "Pure Guest"}
-        serializer = AuthorSerializer(data=data)
+    def test_deserialization_update_name_does_not_update_slug_if_slug_is_provided(self):
+        original_slug = self.cat_tech.slug
+        data = {'name': 'Tech Serializers Renamed Again', 'slug': original_slug} # Explicitly keeping old slug
+        serializer = BlogCategorySerializer(instance=self.cat_tech, data=data, partial=True)
         self.assertTrue(serializer.is_valid(), serializer.errors)
-        author = serializer.save()
-        self.assertIsNone(author.user)
-        self.assertEqual(author.display_name, "Pure Guest")
+        category = serializer.save()
+        self.assertEqual(category.name, 'Tech Serializers Renamed Again')
+        self.assertEqual(category.slug, original_slug) # Slug should not have changed
 
 
-class BlogPostSerializerTests(TestCase):
-    def setUp(self):
-        self.user_author = User.objects.create_user(
-            email="bp_author@example.com", password="password", full_name="BP Author"
-        )
-        self.user_author.profile_picture_url = "http://example.com/bp_author.png"
-        self.user_author.save()
-
-        self.guest_author_profile = Author.objects.create(display_name="Guest Expert")
-        self.category = BlogCategory.objects.create(name="Tech News")
-        self.tag_ai = Tag.objects.create(name="AI")
-
-        self.post_by_user = BlogPost.objects.create(
-            title="AI in 2025", author=self.user_author, content_html="<p>Future is AI.</p>",
-            status='published', category=self.category
-        )
-        self.post_by_user.tags.add(self.tag_ai)
-
-        self.post_by_guest_override = BlogPost.objects.create(
-            title="My Guest Post", author=self.user_author, # Uplas user still main author
-            author_profile_override=self.guest_author_profile,
-            content_html="<p>A guest's view.</p>", status='draft'
-        )
-        
-        self.factory = APIRequestFactory()
-        self.request = self.factory.get('/') # Dummy request for context
-
-    def test_blog_post_serializer_output_by_uplas_user(self):
-        serializer = BlogPostSerializer(self.post_by_user, context={'request': self.request})
+class BlogPostTagSerializerTests(BlogSerializerTestDataMixin, TestCase):
+    def test_serialization_output(self):
+        serializer = BlogPostTagSerializer(instance=self.tag_drf)
         data = serializer.data
-        self.assertEqual(data['title'], self.post_by_user.title)
-        self.assertEqual(data['display_author_name'], self.user_author.full_name)
-        self.assertEqual(data['display_author_avatar_url'], self.user_author.profile_picture_url)
-        self.assertEqual(data['category']['name'], self.category.name)
-        self.assertEqual(len(data['tags']), 1)
-        self.assertEqual(data['tags'][0]['name'], self.tag_ai.name)
-        self.assertEqual(data['status'], 'published')
-        self.assertEqual(data['comment_count'], 0) # Based on method
+        self.assertEqual(data['name'], self.tag_drf.name)
+        self.assertEqual(data['slug'], self.tag_drf.slug)
 
-    def test_blog_post_serializer_output_by_guest_override(self):
-        serializer = BlogPostSerializer(self.post_by_guest_override, context={'request': self.request})
+    # Add create/update tests similar to BlogCategorySerializer if slug generation is implemented there
+
+
+class BlogPostSerializersTests(BlogSerializerTestDataMixin, TestCase):
+    def test_blog_post_list_serializer_output(self):
+        self.post_published.refresh_from_db() # For comment_count
+        serializer = BlogPostListSerializer(instance=self.post_published, context={'request': self.request_anonymous})
         data = serializer.data
-        self.assertEqual(data['title'], self.post_by_guest_override.title)
-        self.assertEqual(data['display_author_name'], self.guest_author_profile.display_name)
-        self.assertIsNone(data['display_author_avatar_url']) # Guest author has no avatar set
-        self.assertEqual(data['status'], 'draft')
+        self.assertEqual(data['title'], self.post_published.title)
+        self.assertEqual(data['author']['username'], self.author_user.username)
+        self.assertEqual(data['category']['name'], self.cat_tech.name)
+        self.assertEqual(len(data['tags']), 2)
+        self.assertEqual(data['status_display'], self.post_published.get_status_display())
+        self.assertEqual(data['comment_count'], 1) # comment_on_published
+        # self.assertFalse(data['is_liked_by_user']) # Anonymous user
 
-    def test_blog_post_serializer_create_valid(self):
-        # For creation, author_id is required
-        post_data = {
-            "title": "API Created Post",
-            "content_html": "<p>Created via API.</p>",
+    def test_blog_post_detail_serializer_read(self):
+        serializer = BlogPostDetailSerializer(instance=self.post_published, context={'request': self.request_author})
+        data = serializer.data
+        self.assertEqual(data['title'], self.post_published.title)
+        self.assertEqual(data['content_markdown'], self.post_published.content_markdown)
+        self.assertEqual(data['author']['id'], self.author_user.id)
+        self.assertTrue(data['user_can_edit']) # Author viewing their own post
+
+    def test_blog_post_detail_serializer_create_by_author(self):
+        data = {
+            "title": "My New Blog Post via Serializer",
+            "category_id": self.cat_tutorials.id,
+            "tag_ids": [self.tag_python.id, self.tag_webdev.id],
+            "excerpt": "A quick summary.",
+            "content_markdown": "Full content of the new post.",
             "status": "draft",
-            "author_id": self.user_author.id, # Required
-            "category_id": self.category.id,
-            "tag_ids": [self.tag_ai.id]
+            "featured_image": "http://example.com/image.jpg"
         }
-        serializer = BlogPostSerializer(data=post_data, context={'request': self.request})
+        serializer = BlogPostDetailSerializer(data=data, context={'request': self.request_author})
         self.assertTrue(serializer.is_valid(), serializer.errors)
-        # saved_post = serializer.save() # Author is already part of validated_data due to author_id
-        # self.assertEqual(saved_post.author, self.user_author)
+        blog_post = serializer.save() # Author is set from context by serializer's create
+        
+        self.assertEqual(blog_post.title, "My New Blog Post via Serializer")
+        self.assertEqual(blog_post.author, self.author_user)
+        self.assertEqual(blog_post.category, self.cat_tutorials)
+        self.assertEqual(blog_post.tags.count(), 2)
+        self.assertIn(self.tag_python, blog_post.tags.all())
+        self.assertEqual(blog_post.status, 'draft')
+        self.assertEqual(blog_post.slug, slugify("My New Blog Post via Serializer"))
 
-    def test_blog_post_serializer_create_missing_author(self):
-        post_data = {"title": "No Author Post", "content_html": "c", "status": "draft"}
-        serializer = BlogPostSerializer(data=post_data, context={'request': self.request})
+    def test_blog_post_detail_serializer_update_by_author(self):
+        data = {
+            "title": "Serializing Django Models (Updated)",
+            "content_markdown": "Updated Markdown content here.",
+            "status": "published",
+            "tag_ids": [self.tag_django.id] # Change tags
+        }
+        serializer = BlogPostDetailSerializer(instance=self.post_published, data=data, partial=True, context={'request': self.request_author})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        blog_post = serializer.save()
+        self.assertEqual(blog_post.title, "Serializing Django Models (Updated)")
+        self.assertEqual(blog_post.tags.count(), 1)
+        self.assertIn(self.tag_django, blog_post.tags.all())
+        self.assertNotIn(self.tag_python, blog_post.tags.all()) # Python tag should be removed
+        self.assertEqual(blog_post.status, 'published')
+        self.assertIsNotNone(blog_post.published_at)
+
+    def test_blog_post_detail_serializer_title_validation(self):
+        data = {"title": "Short", "content_markdown": "Valid content."} # Title too short
+        serializer = BlogPostDetailSerializer(data=data, context={'request': self.request_author})
         self.assertFalse(serializer.is_valid())
-        self.assertIn('author_id', serializer.errors) # author_id is required=True
-
-    def test_blog_post_serializer_comment_count_method(self):
-        BlogComment.objects.create(post=self.post_by_user, content="C1", is_approved=True)
-        BlogComment.objects.create(post=self.post_by_user, content="C2 (unapproved)", is_approved=False)
-        BlogComment.objects.create(post=self.post_by_user, content="C3", is_approved=True)
-
-        serializer = BlogPostSerializer(self.post_by_user, context={'request': self.request})
-        self.assertEqual(serializer.data['comment_count'], 2) # Only approved comments
+        self.assertIn('title', serializer.errors)
+        self.assertIn("at least 10 characters long", str(serializer.errors['title']))
 
 
-class BlogCommentSerializerTests(TestCase):
-    def setUp(self):
-        self.blog_author = User.objects.create_user(email="bc_post_author@example.com", password="password")
-        self.commenter_auth = User.objects.create_user(email="bc_auth_user@example.com", password="password", full_name="Auth Commenter")
-        self.commenter_auth.profile_picture_url = "http://example.com/auth_commenter.png"
-        self.commenter_auth.save()
-
-        self.post = BlogPost.objects.create(author=self.blog_author, title="Comment Test Post", content_html="...")
-        
-        self.factory = APIRequestFactory()
-        self.request_authenticated = self.factory.post('/') # Simulate POST for creating comment
-        self.request_authenticated.user = self.commenter_auth
-        
-        self.request_guest = self.factory.post('/')
-        self.request_guest.user = MagicMock(is_authenticated=False) # Simulate anonymous user
-
-
-    def test_blog_comment_serializer_output_authenticated_user(self):
-        comment = BlogComment.objects.create(post=self.post, author=self.commenter_auth, content="By auth user.")
-        serializer = BlogCommentSerializer(comment, context={'request': self.request_authenticated})
+class BlogCommentSerializerTests(BlogSerializerTestDataMixin, TestCase):
+    def test_serialization_output(self):
+        self.comment_on_published.refresh_from_db() # For like_count if implemented
+        serializer = BlogCommentSerializer(instance=self.comment_on_published, context={'request': self.request_author})
         data = serializer.data
-        self.assertEqual(data['content'], comment.content)
-        self.assertIsNotNone(data['author']) # Should show author PK
-        self.assertEqual(data['commenter_display_name'], self.commenter_auth.full_name)
-        self.assertEqual(data['commenter_avatar_url'], self.commenter_auth.profile_picture_url)
-        self.assertEqual(data['author_name'], "") # Guest field should be empty
+        self.assertEqual(data['content'], self.comment_on_published.content)
+        self.assertEqual(data['author']['username'], self.commenter_user.username)
+        self.assertTrue(data['is_publicly_visible'])
+        self.assertTrue(data['user_can_edit']) # author_user is staff in this test setup
 
-    def test_blog_comment_serializer_output_guest_user(self):
-        comment = BlogComment.objects.create(post=self.post, author_name="Guesty", content="By guest.")
-        serializer = BlogCommentSerializer(comment, context={'request': self.request_guest}) # Guest request
-        data = serializer.data
-        self.assertEqual(data['content'], comment.content)
-        self.assertIsNone(data['author']) # No Uplas user linked
-        self.assertEqual(data['author_name'], "Guesty")
-        self.assertEqual(data['commenter_display_name'], "Guesty")
-        self.assertTrue("Guesty" in data['commenter_avatar_url']) # Placeholder avatar
-
-    def test_blog_comment_create_by_authenticated_user(self):
-        data = {"content": "Authenticated reply."}
-        # 'post' and 'author' are set by the view from context.
-        # Serializer needs 'post_instance' in context for parent_comment validation if applicable.
-        serializer = BlogCommentSerializer(data=data, context={'request': self.request_authenticated, 'post_instance': self.post})
+    def test_deserialization_create_valid_comment(self):
+        data = {
+            "blog_post_id": self.post_published.id,
+            "content": "A new comment from user1."
+        }
+        serializer = BlogCommentSerializer(data=data, context={'request': self.request_author})
         self.assertTrue(serializer.is_valid(), serializer.errors)
-        # saved_comment = serializer.save(author=self.commenter_auth, post=self.post)
-        # self.assertEqual(saved_comment.author, self.commenter_auth)
-        # self.assertEqual(saved_comment.author_name, "")
+        comment = serializer.save() # Author set from context by serializer's create
+        self.assertEqual(comment.author, self.author_user)
+        self.assertEqual(comment.blog_post, self.post_published)
+        self.assertEqual(comment.content, "A new comment from user1.")
+        self.post_published.refresh_from_db()
+        self.assertEqual(self.post_published.comment_count, 3) # comment1, comment2_reply, new one
 
-    def test_blog_comment_create_by_guest_valid(self):
-        data = {"author_name": "Guest User", "content": "Guest comment here."}
-        serializer = BlogCommentSerializer(data=data, context={'request': self.request_guest, 'post_instance': self.post})
+    def test_deserialization_create_reply_valid(self):
+        data = {
+            "blog_post_id": self.post_published.id,
+            "parent_comment_id": self.comment_on_published.id,
+            "content": "Replying to the first comment."
+        }
+        serializer = BlogCommentSerializer(data=data, context={'request': self.request_author})
         self.assertTrue(serializer.is_valid(), serializer.errors)
-        # saved_comment = serializer.save(post=self.post) # Author will be None
-        # self.assertIsNone(saved_comment.author)
-        # self.assertEqual(saved_comment.author_name, "Guest User")
+        reply = serializer.save()
+        self.assertEqual(reply.parent_comment, self.comment_on_published)
+        self.assertEqual(reply.blog_post, self.post_published)
 
-    def test_blog_comment_create_by_guest_missing_name(self):
-        data = {"content": "Guest comment without name."} # Missing author_name
-        serializer = BlogCommentSerializer(data=data, context={'request': self.request_guest, 'post_instance': self.post})
+    def test_deserialization_create_comment_on_draft_post_fails(self):
+        data = {"blog_post_id": self.post_draft.id, "content": "Trying to comment on draft."}
+        serializer = BlogCommentSerializer(data=data, context={'request': self.request_commenter})
         self.assertFalse(serializer.is_valid())
-        self.assertIn('author_name', serializer.errors)
+        self.assertIn('blog_post_id', serializer.errors)
+        self.assertIn("Comments are only allowed on published blog posts.", str(serializer.errors['blog_post_id']))
 
-    def test_blog_comment_reply_validation_same_post(self):
-        parent_comment = BlogComment.objects.create(post=self.post, author=self.commenter_auth, content="Parent")
-        other_post = BlogPost.objects.create(author=self.blog_author, title="Other Post", content_html="...")
+    def test_deserialization_reply_to_comment_on_different_post_fails(self):
+        # Create another post
+        another_post = BlogPost.objects.create(author=self.author_user, title="Another Post", slug="another-post-ser", content_markdown="c", status='published')
         
-        # Attempt to reply to parent_comment but associate with other_post (via context)
-        data = {"content": "Reply to wrong post's comment", "parent_comment_id": parent_comment.id}
-        serializer = BlogCommentSerializer(data=data, context={'request': self.request_authenticated, 'post_instance': other_post})
+        data = {
+            "blog_post_id": another_post.id, # Replying to another_post
+            "parent_comment_id": self.comment_on_published.id, # But parent is on self.post_published
+            "content": "Mismatched parent."
+        }
+        serializer = BlogCommentSerializer(data=data, context={'request': self.request_commenter})
         self.assertFalse(serializer.is_valid())
-        self.assertIn('parent_comment_id', serializer.errors) # Validation in serializer checks this
+        self.assertIn('parent_comment_id', serializer.errors)
+        self.assertIn("Parent comment does not belong to the same blog post.", str(serializer.errors['parent_comment_id']))
 
-    def test_blog_comment_reply_validation_correct_post(self):
-        parent_comment = BlogComment.objects.create(post=self.post, author=self.commenter_auth, content="Parent")
-        data = {"content": "Valid reply", "parent_comment_id": parent_comment.id}
-        serializer = BlogCommentSerializer(data=data, context={'request': self.request_authenticated, 'post_instance': self.post})
-        self.assertTrue(serializer.is_valid(), serializer.errors)
+# Add more tests for:
+# - SerializerMethodFields like 'is_liked_by_user' when Like model is integrated.
+# - Update operations for BlogCommentSerializer.
+# - Validation of all fields in all serializers.
+# - Behavior of read-only and write-only fields during updates.
+# - Slug generation edge cases in BlogCategorySerializer and BlogPostTagSerializer if implemented there.
