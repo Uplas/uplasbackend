@@ -1,343 +1,413 @@
-from django.urls import reverse
 from django.contrib.auth import get_user_model
+from django.urls import reverse
 from django.utils import timezone
-from unittest.mock import patch # If any external calls were made (not typical for this app)
+from django.utils.text import slugify
+from django.contrib.contenttypes.models import ContentType # For Like/Report tests
 
-from rest_framework.test import APITestCase, APIClient
 from rest_framework import status
+from rest_framework.test import APITestCase
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from ..models import (
-    CommunityCategory, CommunityGroup, GroupMembership,
-    CommunityPost, PostComment, PostReaction
+from apps.community.models import (
+    Forum, Thread, Post, Comment, Like, Report
 )
-from apps.projects.models import ProjectTag # Assuming shared tag model
+# Import serializers to compare response data (optional, can also check specific fields)
+from apps.community.serializers import (
+    ForumListSerializer, ForumDetailSerializer,
+    ThreadListSerializer, ThreadDetailSerializer, PostSerializer
+)
 
 User = get_user_model()
 
-class CommunityCategoryViewSetTests(APITestCase):
-    def setUp(self):
-        self.cat1 = CommunityCategory.objects.create(name="General", display_order=1)
-        self.cat2 = CommunityCategory.objects.create(name="Feedback", display_order=0)
-        self.list_url = reverse('community:communitycategory-list')
-
-    def test_list_categories(self):
-        response = self.client.get(self.list_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data['results']), 2)
-        self.assertEqual(response.data['results'][0]['name'], self.cat2.name) # Ordered by display_order
-        self.assertIn('posts_count', response.data['results'][0]) # Check for annotated count
-
-
-class CommunityGroupViewSetTests(APITestCase):
-    def setUp(self):
-        self.creator = User.objects.create_user(email="creator_cg@example.com", password="password", full_name="Group Creator")
-        self.member1 = User.objects.create_user(email="member1_cg@example.com", password="password", full_name="Member One")
-        self.non_member = User.objects.create_user(email="nonmember_cg@example.com", password="password", full_name="Non Member")
-
-        self.public_group = CommunityGroup.objects.create(name="Public Study Group", creator=self.creator, description="Open to all", is_private=False)
-        self.private_group = CommunityGroup.objects.create(name="Private Project Team", creator=self.creator, description="Invite only", is_private=True)
-        # Creator is automatically made an admin member by model's perform_create
-        # GroupMembership.objects.create(user=self.creator, group=self.private_group, role='admin') # Already done by perform_create in view
-        GroupMembership.objects.create(user=self.member1, group=self.private_group, role='member')
-
-
-        self.list_create_url = reverse('community:communitygroup-list')
-        self.detail_public_url = reverse('community:communitygroup-detail', kwargs={'slug': self.public_group.slug})
-        self.detail_private_url = reverse('community:communitygroup-detail', kwargs={'slug': self.private_group.slug})
-        self.join_public_url = reverse('community:communitygroup-join-group', kwargs={'slug': self.public_group.slug})
-        self.leave_public_url = reverse('community:communitygroup-leave-group', kwargs={'slug': self.public_group.slug})
-        self.posts_public_url = reverse('community:communitygroup-list-group-posts', kwargs={'slug': self.public_group.slug})
-
-
-    def test_list_groups_unauthenticated(self):
-        response = self.client.get(self.list_create_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        # Should only see public_group
-        self.assertEqual(len(response.data['results']), 1)
-        self.assertEqual(response.data['results'][0]['name'], self.public_group.name)
-
-    def test_list_groups_authenticated_non_member(self):
-        self.client.force_authenticate(user=self.non_member)
-        response = self.client.get(self.list_create_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        # Should see public_group, and private_group if they are a member (not in this case)
-        group_names = {g['name'] for g in response.data['results']}
-        self.assertIn(self.public_group.name, group_names)
-        self.assertNotIn(self.private_group.name, group_names) # Non-member shouldn't see private group
-
-    def test_list_groups_authenticated_member_of_private(self):
-        self.client.force_authenticate(user=self.member1) # member1 is in private_group
-        response = self.client.get(self.list_create_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        group_names = {g['name'] for g in response.data['results']}
-        self.assertIn(self.public_group.name, group_names)
-        self.assertIn(self.private_group.name, group_names) # Member should see private group
-
-    def test_create_group_authenticated(self):
-        self.client.force_authenticate(user=self.non_member)
-        data = {"name": "My New Group", "description": "A group by non_member."}
-        response = self.client.post(self.list_create_url, data, format='json')
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        self.assertTrue(CommunityGroup.objects.filter(name="My New Group", creator=self.non_member).exists())
-        new_group = CommunityGroup.objects.get(name="My New Group")
-        self.assertTrue(GroupMembership.objects.filter(user=self.non_member, group=new_group, role='admin').exists())
-
-    def test_retrieve_public_group(self):
-        response = self.client.get(self.detail_public_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data['name'], self.public_group.name)
-
-    def test_retrieve_private_group_member_succeeds(self):
-        self.client.force_authenticate(user=self.member1)
-        response = self.client.get(self.detail_private_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data['name'], self.private_group.name)
-
-    def test_retrieve_private_group_non_member_fails(self):
-        self.client.force_authenticate(user=self.non_member)
-        response = self.client.get(self.detail_private_url)
-        # The get_queryset in the view should filter it out, leading to 404
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-
-
-    def test_join_public_group_success(self):
-        self.client.force_authenticate(user=self.non_member)
-        response = self.client.post(self.join_public_url)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        self.assertTrue(GroupMembership.objects.filter(user=self.non_member, group=self.public_group).exists())
-
-    def test_join_public_group_already_member(self):
-        GroupMembership.objects.create(user=self.non_member, group=self.public_group)
-        self.client.force_authenticate(user=self.non_member)
-        response = self.client.post(self.join_public_url)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-
-    def test_leave_public_group_success(self):
-        GroupMembership.objects.create(user=self.non_member, group=self.public_group)
-        self.client.force_authenticate(user=self.non_member)
-        response = self.client.post(self.leave_public_url)
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.data)
-        self.assertFalse(GroupMembership.objects.filter(user=self.non_member, group=self.public_group).exists())
-
-    def test_creator_cannot_leave_if_sole_admin(self):
-        # Creator is auto-admin. No other admins.
-        self.client.force_authenticate(user=self.creator)
-        leave_private_url = reverse('community:communitygroup-leave-group', kwargs={'slug': self.private_group.slug})
-        response = self.client.post(leave_private_url)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("sole admin", response.data['detail'])
-
-
-    def test_list_posts_in_public_group(self):
-        CommunityPost.objects.create(author=self.creator, group=self.public_group, title="Post in Public", content_html="...")
-        self.client.force_authenticate(user=self.non_member) # Non-member can see posts in public group
-        response = self.client.get(self.posts_public_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data['results']), 1)
-
-    def test_create_post_in_group_member_succeeds(self):
-        GroupMembership.objects.create(user=self.member1, group=self.public_group) # Make member1 a member of public_group
-        self.client.force_authenticate(user=self.member1)
-        data = {"title": "Member Post", "content_html": "My content"}
-        response = self.client.post(self.posts_public_url, data, format='json')
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        self.assertTrue(CommunityPost.objects.filter(title="Member Post", group=self.public_group, author=self.member1).exists())
-
-    def test_create_post_in_group_non_member_fails(self): # Assuming CanPostInGroup requires membership
-        self.client.force_authenticate(user=self.non_member) # non_member is not in public_group
-        data = {"title": "Non Member Post", "content_html": "My content"}
-        response = self.client.post(self.posts_public_url, data, format='json')
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN) # CanPostInGroup permission
-
-
-class CommunityPostViewSetTests(APITestCase):
-    def setUp(self):
-        self.user1 = User.objects.create_user(email="postuser1@example.com", password="password", full_name="Post User One")
-        self.user2 = User.objects.create_user(email="postuser2@example.com", password="password", full_name="Post User Two")
-        self.category = CommunityCategory.objects.create(name="General Posts")
-        self.tag1 = ProjectTag.objects.create(name="Discussion")
-        self.post1 = CommunityPost.objects.create(
-            author=self.user1, title="First Discussion", slug="first-discussion",
-            content_html="<p>Content 1</p>", category=self.category,
-            last_activity_at=timezone.now() - timezone.timedelta(hours=1)
+# Test Data Setup Mixin (adapted for APITestCase)
+class CommunityViewTestDataMixin:
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin_user = User.objects.create_superuser(
+            username='comview_admin', email='comview_admin@example.com', password='password123',
+            full_name='ComView Admin'
         )
-        self.post1.tags.add(self.tag1)
-        self.post2_closed = CommunityPost.objects.create(
-            author=self.user2, title="Closed Topic", slug="closed-topic",
-            content_html="<p>No comments please.</p>", is_closed=True
+        cls.user1 = User.objects.create_user(
+            username='comview_user1', email='comview_user1@example.com', password='password123',
+            full_name='ComView User One'
+        )
+        cls.user2 = User.objects.create_user(
+            username='comview_user2', email='comview_user2@example.com', password='password123',
+            full_name='ComView User Two'
+        )
+        # cls.moderator_user is effectively admin_user if moderators are staff
+
+        cls.forum1 = Forum.objects.create(name='View Test Forum Alpha', slug='view-test-forum-alpha', display_order=0)
+        cls.forum2 = Forum.objects.create(name='View Test Forum Beta', slug='view-test-forum-beta', display_order=1)
+
+        cls.thread1_forum1_user1 = Thread.objects.create(
+            forum=cls.forum1, author=cls.user1,
+            title='Thread Alpha by User1', slug='thread-alpha-user1',
+            content='Content for thread alpha.'
+        )
+        cls.thread2_forum1_user2 = Thread.objects.create(
+            forum=cls.forum1, author=cls.user2,
+            title='Thread Beta by User2', slug='thread-beta-user2',
+            content='Content for thread beta.', is_closed=True # A closed thread
+        )
+        cls.thread3_forum2_user1_hidden = Thread.objects.create(
+            forum=cls.forum2, author=cls.user1,
+            title='Hidden Thread Gamma by User1', slug='hidden-thread-gamma-user1',
+            content='This thread is hidden.', is_hidden=True
+        )
+        
+        cls.post1_thread1_user2 = Post.objects.create(
+            thread=cls.thread1_forum1_user1, author=cls.user2,
+            content="User2's reply to thread alpha."
         )
 
-        self.list_create_url = reverse('community:communitypost-list')
-        self.detail_url_post1 = reverse('community:communitypost-detail', kwargs={'slug': self.post1.slug})
-        self.comments_url_post1 = reverse('community:communitypost-manage-comments', kwargs={'slug': self.post1.slug})
-        self.react_url_post1 = reverse('community:communitypost-react-to-item', kwargs={'slug': self.post1.slug})
+
+    def get_jwt_tokens_for_user(self, user):
+        refresh = RefreshToken.for_user(user)
+        return {'refresh': str(refresh), 'access': str(refresh.access_token)}
+
+    def authenticate_client_with_jwt(self, user):
+        tokens = self.get_jwt_tokens_for_user(user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {tokens["access"]}')
+
+    def setUp(self):
+        super().setUp() # Call parent setUp if it exists
 
 
-    def test_list_posts(self):
-        response = self.client.get(self.list_create_url)
+class ForumViewSetTests(CommunityViewTestDataMixin, APITestCase):
+    def test_list_forums_anonymous(self):
+        url = reverse('community:forum-list')
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data['results']), 2)
+        self.assertEqual(len(response.data['results']), 2) # forum1 and forum2
 
-    def test_create_post_authenticated(self):
-        self.client.force_authenticate(user=self.user1)
+    def test_retrieve_forum_anonymous(self):
+        url = reverse('community:forum-detail', kwargs={'slug': self.forum1.slug})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['name'], self.forum1.name)
+
+    def test_create_forum_admin_success(self):
+        self.authenticate_client_with_jwt(self.admin_user)
+        url = reverse('community:forum-list')
+        data = {'name': 'Admin Forum Gamma', 'slug': 'admin-forum-gamma', 'description': 'Admin created.'}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(Forum.objects.filter(slug='admin-forum-gamma').exists())
+
+    def test_create_forum_non_admin_forbidden(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('community:forum-list')
+        data = {'name': 'User1 Forum Fail', 'slug': 'user1-forum-fail'}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN) # IsAdminOrReadOnly
+
+    def test_update_forum_admin_success(self):
+        self.authenticate_client_with_jwt(self.admin_user)
+        url = reverse('community:forum-detail', kwargs={'slug': self.forum1.slug})
+        data = {'name': 'View Test Forum Alpha (Updated)'}
+        response = self.client.patch(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.forum1.refresh_from_db()
+        self.assertEqual(self.forum1.name, 'View Test Forum Alpha (Updated)')
+
+    def test_delete_forum_admin_success(self):
+        self.authenticate_client_with_jwt(self.admin_user)
+        forum_to_delete = Forum.objects.create(name="To Delete Forum", slug="to-delete-forum")
+        url = reverse('community:forum-detail', kwargs={'slug': forum_to_delete.slug})
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Forum.objects.filter(slug='to-delete-forum').exists())
+
+
+class ThreadViewSetTests(CommunityViewTestDataMixin, APITestCase):
+    # Test listing threads (top-level and nested under forum)
+    def test_list_threads_top_level_anonymous(self):
+        """ Anonymous users see non-hidden threads. """
+        url = reverse('community:thread-global-list') # Using the top-level registration
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # thread1_forum1_user1, thread2_forum1_user2 are not hidden
+        # thread3_forum2_user1_hidden is hidden
+        self.assertEqual(len(response.data['results']), 2)
+        slugs_in_response = [item['slug'] for item in response.data['results']]
+        self.assertIn(self.thread1_forum1_user1.slug, slugs_in_response)
+        self.assertIn(self.thread2_forum1_user2.slug, slugs_in_response)
+        self.assertNotIn(self.thread3_forum2_user1_hidden.slug, slugs_in_response)
+
+    def test_list_threads_nested_under_forum_anonymous(self):
+        url = reverse('community:forum-thread-list', kwargs={'forum_slug': self.forum1.slug})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 2) # thread1 and thread2 in forum1
+        self.assertEqual(response.data['results'][0]['slug'], self.thread1_forum1_user1.slug) # Ordered by last_activity (default) or pinned
+
+    def test_list_hidden_threads_by_admin_top_level(self):
+        self.authenticate_client_with_jwt(self.admin_user)
+        url = reverse('community:thread-global-list')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 3) # Admin sees all, including hidden
+
+    # Test retrieving threads
+    def test_retrieve_thread_anonymous(self):
+        url = reverse('community:thread-global-detail', kwargs={'slug': self.thread1_forum1_user1.slug})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['title'], self.thread1_forum1_user1.title)
+        self.assertEqual(response.data['view_count'], 1) # View count incremented
+
+    def test_retrieve_hidden_thread_anonymous_forbidden(self):
+        url = reverse('community:thread-global-detail', kwargs={'slug': self.thread3_forum2_user1_hidden.slug})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN) # IsAuthorOrReadOnly (object perm)
+
+    def test_retrieve_hidden_thread_by_author(self):
+        self.authenticate_client_with_jwt(self.user1) # user1 is author of hidden thread
+        url = reverse('community:thread-global-detail', kwargs={'slug': self.thread3_forum2_user1_hidden.slug})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_retrieve_hidden_thread_by_admin(self):
+        self.authenticate_client_with_jwt(self.admin_user)
+        url = reverse('community:thread-global-detail', kwargs={'slug': self.thread3_forum2_user1_hidden.slug})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    # Test creating threads
+    def test_create_thread_authenticated_user_success(self):
+        self.authenticate_client_with_jwt(self.user2)
+        url = reverse('community:forum-thread-list', kwargs={'forum_slug': self.forum2.slug}) # Create in forum2
         data = {
-            "title": "My New Uplas Post",
-            "content_html": "<p>Awesome thoughts here.</p>",
-            "category_id": self.category.id,
-            "tag_ids": [self.tag1.id]
+            "title": "User2 New Thread in Forum2",
+            "content": "Exciting content here!",
+            # Slug should be auto-generated by serializer if not provided
         }
-        response = self.client.post(self.list_create_url, data, format='json')
+        response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        self.assertTrue(CommunityPost.objects.filter(title="My New Uplas Post", author=self.user1).exists())
+        new_thread_slug = slugify("User2 New Thread in Forum2")
+        self.assertTrue(Thread.objects.filter(slug=new_thread_slug, author=self.user2, forum=self.forum2).exists())
 
-    def test_retrieve_post_increments_view_count(self):
-        initial_views = self.post1.view_count
-        response = self.client.get(self.detail_url_post1)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.post1.refresh_from_db()
-        self.assertEqual(self.post1.view_count, initial_views + 1)
+    def test_create_thread_unauthenticated_forbidden(self):
+        url = reverse('community:forum-thread-list', kwargs={'forum_slug': self.forum1.slug})
+        data = {"title": "Anon Thread Fail", "content": "test"}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED) # IsAuthenticated
 
-    def test_update_own_post(self):
-        self.client.force_authenticate(user=self.user1)
-        data = {"title": "First Discussion [Updated]", "content_html": "<p>Updated content.</p>"}
-        response = self.client.patch(self.detail_url_post1, data, format='json') # PATCH for partial update
+    # Test updating threads
+    def test_update_own_thread_by_author_success(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('community:thread-global-detail', kwargs={'slug': self.thread1_forum1_user1.slug})
+        data = {"title": "Thread Alpha by User1 (Updated)", "content": "Updated content."}
+        response = self.client.patch(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.post1.refresh_from_db()
-        self.assertEqual(self.post1.title, "First Discussion [Updated]")
+        self.thread1_forum1_user1.refresh_from_db()
+        self.assertEqual(self.thread1_forum1_user1.title, "Thread Alpha by User1 (Updated)")
 
-    def test_update_others_post_fails(self):
-        self.client.force_authenticate(user=self.user2) # user2 is not author of post1
-        data = {"title": "Malicious Update"}
-        response = self.client.patch(self.detail_url_post1, data, format='json')
+    def test_update_other_user_thread_forbidden(self):
+        self.authenticate_client_with_jwt(self.user2) # user2 trying to update user1's thread
+        url = reverse('community:thread-global-detail', kwargs={'slug': self.thread1_forum1_user1.slug})
+        data = {"title": "Attempted Update by User2"}
+        response = self.client.patch(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN) # IsAuthorOrReadOnly
 
-    def test_delete_own_post(self):
-        self.client.force_authenticate(user=self.user1)
-        response = self.client.delete(self.detail_url_post1)
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(CommunityPost.objects.filter(slug=self.post1.slug).exists())
-
-    # --- Comments on Post Tests ---
-    def test_list_comments_for_post(self):
-        PostComment.objects.create(post=self.post1, author=self.user2, content_html="A comment")
-        response = self.client.get(self.comments_url_post1)
+    def test_update_thread_by_admin_success(self):
+        self.authenticate_client_with_jwt(self.admin_user)
+        url = reverse('community:thread-global-detail', kwargs={'slug': self.thread1_forum1_user1.slug})
+        data = {"title": "Thread Alpha (Admin Update)", "is_pinned": True}
+        response = self.client.patch(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data['results']), 1)
+        self.thread1_forum1_user1.refresh_from_db()
+        self.assertTrue(self.thread1_forum1_user1.is_pinned)
 
-    def test_create_comment_on_post_authenticated(self):
-        self.client.force_authenticate(user=self.user2)
-        data = {"content_html": "My insightful comment."}
-        response = self.client.post(self.comments_url_post1, data, format='json')
+    # Test deleting threads
+    def test_delete_own_thread_by_author_success(self):
+        self.authenticate_client_with_jwt(self.user1)
+        thread_to_delete = Thread.objects.create(forum=self.forum1, author=self.user1, title="To Delete", slug="to-delete", content="c")
+        url = reverse('community:thread-global-detail', kwargs={'slug': thread_to_delete.slug})
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Thread.objects.filter(slug=thread_to_delete.slug).exists())
+
+    # Test moderator actions on threads
+    def test_pin_thread_by_moderator_success(self):
+        self.authenticate_client_with_jwt(self.admin_user) # admin_user is moderator
+        url = reverse('community:thread-global-pin-thread', kwargs={'slug': self.thread1_forum1_user1.slug})
+        response = self.client.post(url, {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.thread1_forum1_user1.refresh_from_db()
+        self.assertTrue(self.thread1_forum1_user1.is_pinned)
+
+    def test_pin_thread_by_non_moderator_forbidden(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('community:thread-global-pin-thread', kwargs={'slug': self.thread1_forum1_user1.slug})
+        response = self.client.post(url, {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN) # IsModeratorOrAdmin
+
+    def test_close_thread_by_moderator_success(self):
+        self.authenticate_client_with_jwt(self.admin_user)
+        url = reverse('community:thread-global-close-thread', kwargs={'slug': self.thread1_forum1_user1.slug})
+        response = self.client.post(url, {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.thread1_forum1_user1.refresh_from_db()
+        self.assertTrue(self.thread1_forum1_user1.is_closed)
+
+
+class PostViewSetTests(CommunityViewTestDataMixin, APITestCase):
+    def test_list_posts_for_thread_anonymous(self):
+        # URL: /api/community/forums/{forum_slug}/threads/{thread_slug_or_pk}/posts/
+        url = reverse('community:thread-post-list', kwargs={
+            'forum_slug': self.forum1.slug,
+            'thread_slug': self.thread1_forum1_user1.slug # Assuming ThreadViewSet lookup is 'slug'
+        })
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1) # post1_thread1_user2
+        self.assertEqual(response.data['results'][0]['content'], self.post1_thread1_user2.content)
+
+    def test_create_post_in_thread_authenticated_user_success(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('community:thread-post-list', kwargs={
+            'forum_slug': self.forum1.slug,
+            'thread_slug': self.thread1_forum1_user1.slug
+        })
+        data = {"content": "User1's new reply to thread alpha."}
+        response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        self.assertTrue(PostComment.objects.filter(post=self.post1, author=self.user2).exists())
-        self.post1.refresh_from_db()
-        self.assertEqual(self.post1.comment_count, 1)
+        self.assertTrue(Post.objects.filter(thread=self.thread1_forum1_user1, author=self.user1, content=data['content']).exists())
+        self.thread1_forum1_user1.refresh_from_db()
+        self.assertEqual(self.thread1_forum1_user1.reply_count, 2) # Original post1 + this new one
 
-    def test_create_comment_on_closed_post_fails(self):
-        self.client.force_authenticate(user=self.user1)
-        closed_post_comments_url = reverse('community:communitypost-manage-comments', kwargs={'slug': self.post2_closed.slug})
-        data = {"content_html": "Trying to comment."}
-        response = self.client.post(closed_post_comments_url, data, format='json')
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+    def test_create_post_in_closed_thread_forbidden(self):
+        self.authenticate_client_with_jwt(self.user1)
+        # self.thread2_forum1_user2 is closed
+        url = reverse('community:thread-post-list', kwargs={
+            'forum_slug': self.forum1.slug,
+            'thread_slug': self.thread2_forum1_user2.slug # Closed thread
+        })
+        data = {"content": "Trying to reply to closed thread."}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN) # CanCreateThreadOrPost (via serializer validation or permission)
 
-    # --- Reactions on Post Tests ---
-    def test_react_to_post_success_and_toggle(self):
-        self.client.force_authenticate(user=self.user2)
-        # First reaction (like)
-        response_like = self.client.post(self.react_url_post1, {"reaction_type": "like"}, format='json')
-        self.assertEqual(response_like.status_code, status.HTTP_201_CREATED, response_like.data)
-        self.assertEqual(response_like.data['data']['reaction_type'], 'like')
-        self.post1.refresh_from_db()
-        self.assertEqual(self.post1.reaction_count, 1)
-
-        # React again with same type (unlike)
-        response_unlike = self.client.post(self.react_url_post1, {"reaction_type": "like"}, format='json')
-        self.assertEqual(response_unlike.status_code, status.HTTP_200_OK) # Changed from 204, view returns updated count
-        self.assertEqual(response_unlike.data['status'], 'Reaction removed.')
-        self.post1.refresh_from_db()
-        self.assertEqual(self.post1.reaction_count, 0)
-
-        # React with different type (new reaction)
-        response_heart = self.client.post(self.react_url_post1, {"reaction_type": "heart"}, format='json')
-        self.assertEqual(response_heart.status_code, status.HTTP_201_CREATED)
-        self.post1.refresh_from_db()
-        self.assertEqual(self.post1.reaction_count, 1)
+    def test_update_own_post_by_author_success(self):
+        # user2 is author of post1_thread1_user2
+        self.authenticate_client_with_jwt(self.user2)
+        url = reverse('community:thread-post-detail', kwargs={
+            'forum_slug': self.forum1.slug,
+            'thread_slug': self.thread1_forum1_user1.slug,
+            'pk': self.post1_thread1_user2.pk
+        })
+        data = {"content": "User2's reply (updated)."}
+        response = self.client.patch(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.post1_thread1_user2.refresh_from_db()
+        self.assertEqual(self.post1_thread1_user2.content, "User2's reply (updated).")
 
 
-class PostCommentViewSetTests(APITestCase): # For individual comment management
-    def setUp(self):
-        self.user_comment_author = User.objects.create_user(email="commentauthor@example.com", password="password")
-        self.user_other = User.objects.create_user(email="othercommentuser@example.com", password="password")
-        post_author = User.objects.create_user(email="comment_post_author@example.com", password="password")
-        self.post = CommunityPost.objects.create(author=post_author, title="Post for Comments", content_html="...")
-        self.comment = PostComment.objects.create(post=self.post, author=self.user_comment_author, content_html="Original comment")
+class LikeToggleAPIViewTests(CommunityViewTestDataMixin, APITestCase):
+    def test_like_thread_success(self):
+        self.authenticate_client_with_jwt(self.user2)
+        url = reverse('community:like-toggle')
+        data = {"content_type_model": "thread", "object_id": str(self.thread1_forum1_user1.id)}
         
-        self.detail_url = reverse('community:postcomment-detail', kwargs={'pk': self.comment.pk})
-        self.react_url = reverse('community:postcomment-react-to-item', kwargs={'pk': self.comment.pk})
-
-
-    def test_update_own_comment(self):
-        self.client.force_authenticate(user=self.user_comment_author)
-        data = {"content_html": "Updated comment content."}
-        response = self.client.patch(self.detail_url, data, format='json')
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.comment.refresh_from_db()
-        self.assertEqual(self.comment.content_html, "Updated comment content.")
-
-    def test_delete_own_comment(self):
-        self.client.force_authenticate(user=self.user_comment_author)
-        response = self.client.delete(self.detail_url)
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(PostComment.objects.filter(pk=self.comment.pk).exists())
-        self.post.refresh_from_db()
-        self.assertEqual(self.post.comment_count, 0) # Check signal
-
-
-    def test_react_to_comment_success(self):
-        self.client.force_authenticate(user=self.user_other)
-        response = self.client.post(self.react_url, {"reaction_type": "thumbs_up"}, format='json')
+        response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        self.comment.refresh_from_db()
-        self.assertEqual(self.comment.reaction_count, 1)
+        self.assertTrue(response.data['liked'])
+        self.thread1_forum1_user1.refresh_from_db()
+        self.assertEqual(self.thread1_forum1_user1.like_count, 1)
+
+    def test_unlike_thread_success(self):
+        # First, like the thread
+        Like.objects.create(user=self.user2, content_object=self.thread1_forum1_user1)
+        self.thread1_forum1_user1.refresh_from_db()
+        self.assertEqual(self.thread1_forum1_user1.like_count, 1)
+
+        self.authenticate_client_with_jwt(self.user2)
+        url = reverse('community:like-toggle')
+        data = {"content_type_model": "thread", "object_id": str(self.thread1_forum1_user1.id)}
+        response = self.client.delete(url, data, format='json') # DELETE to unlike
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data) # Or 204
+        self.assertFalse(response.data['liked'])
+        self.thread1_forum1_user1.refresh_from_db()
+        self.assertEqual(self.thread1_forum1_user1.like_count, 0)
+
+    def test_like_already_liked_thread(self):
+        Like.objects.create(user=self.user2, content_object=self.thread1_forum1_user1)
+        self.authenticate_client_with_jwt(self.user2)
+        url = reverse('community:like-toggle')
+        data = {"content_type_model": "thread", "object_id": str(self.thread1_forum1_user1.id)}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK) # Already liked, returns OK
+        self.assertTrue(response.data['liked'])
+
+    def test_like_hidden_content_by_non_staff_forbidden(self):
+        self.authenticate_client_with_jwt(self.user2) # Regular user
+        url = reverse('community:like-toggle')
+        data = {"content_type_model": "thread", "object_id": str(self.thread3_forum2_user1_hidden.id)}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN) # CanInteractWithContent
 
 
-class TrendingTagsViewTests(APITestCase):
+class ReportCreateAPIViewTests(CommunityViewTestDataMixin, APITestCase):
+    def test_create_report_success(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('community:report-content-create')
+        data = {
+            "content_type_model": "post",
+            "object_id": str(self.post1_thread1_user2.id),
+            "reason": "This reply contains spam."
+        }
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(Report.objects.filter(
+            reporter=self.user1,
+            object_id=self.post1_thread1_user2.id,
+            reason="This reply contains spam."
+        ).exists())
+
+    def test_create_report_unauthenticated_forbidden(self):
+        url = reverse('community:report-content-create')
+        data = {"content_type_model": "post", "object_id": str(self.post1_thread1_user2.id), "reason": "test"}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class ReportViewSetAdminTests(CommunityViewTestDataMixin, APITestCase):
     def setUp(self):
-        self.user = User.objects.create_user(email="taguser@example.com", password="password")
-        self.tag_hot = ProjectTag.objects.create(name="HotTopic")
-        self.tag_cool = ProjectTag.objects.create(name="CoolStuff")
-        self.tag_old = ProjectTag.objects.create(name="OldNews")
+        super().setUpTestData()
+        self.report1 = Report.objects.create(
+            reporter=self.user1, content_object=self.post1_thread1_user2,
+            reason="Spam post", status='pending'
+        )
 
-        # Recent posts
-        post1 = CommunityPost.objects.create(author=self.user, title="P1", content_html="c", created_at=timezone.now() - timezone.timedelta(days=1))
-        post1.tags.add(self.tag_hot, self.tag_cool)
-        post2 = CommunityPost.objects.create(author=self.user, title="P2", content_html="c", created_at=timezone.now() - timezone.timedelta(days=2))
-        post2.tags.add(self.tag_hot)
-        # Old post
-        post_old = CommunityPost.objects.create(author=self.user, title="OldP", content_html="c", created_at=timezone.now() - timezone.timedelta(days=10))
-        post_old.tags.add(self.tag_old, self.tag_hot)
-
-        self.url = reverse('community:trending-tags')
-
-    def test_get_trending_tags_default_7_days(self):
-        response = self.client.get(self.url)
+    def test_list_reports_by_admin(self):
+        self.authenticate_client_with_jwt(self.admin_user)
+        url = reverse('community:report-admin-list')
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 2) # HotTopic (2 recent), CoolStuff (1 recent)
-        self.assertEqual(response.data[0]['name'], self.tag_hot.name) # HotTopic should be first
-        self.assertEqual(response.data[1]['name'], self.tag_cool.name)
-        # Check usage_count if serializer exposes it (it's used for ordering)
-        # For this, ProjectTagSerializer would need to include 'usage_count' or similar
+        self.assertTrue(len(response.data['results']) >= 1)
 
-    def test_get_trending_tags_custom_days(self):
-        response = self.client.get(self.url, {'days': '1'}) # Only post1 tags
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 2) # HotTopic, CoolStuff from post1
-        # Order might be HotTopic then CoolStuff or vice-versa depending on secondary sort (name)
+    def test_list_reports_by_non_admin_forbidden(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('community:report-admin-list')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN) # CanManageReport
 
-    def test_get_trending_tags_no_recent_posts(self):
-        # Delete recent posts for this test
-        CommunityPost.objects.filter(created_at__gte=timezone.now() - timezone.timedelta(days=7)).delete()
-        response = self.client.get(self.url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 0) # No tags from posts in last 7 days
+    def test_update_report_status_by_admin(self):
+        self.authenticate_client_with_jwt(self.admin_user)
+        url = reverse('community:report-admin-update-status', kwargs={'pk': self.report1.pk})
+        data = {"status": "resolved_action_taken", "moderator_notes": "User warned."}
+        response = self.client.patch(url, data, format='json') # PATCH for custom action
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.report1.refresh_from_db()
+        self.assertEqual(self.report1.status, "resolved_action_taken")
+        self.assertEqual(self.report1.moderator_notes, "User warned.")
+        self.assertEqual(self.report1.resolved_by, self.admin_user)
+
+# TODO:
+# - More tests for CommentViewSet if fully implemented.
+# - Test all permissions thoroughly for each action and user type.
+# - Test filtering, searching, ordering for ViewSets that support them.
+# - Test pagination for list views.
+# - Test error responses for invalid data in POST/PUT/PATCH more extensively.
+# - Test behavior when trying to interact with content in hidden threads by non-staff.
