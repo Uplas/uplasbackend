@@ -1,254 +1,267 @@
 from django.shortcuts import get_object_or_404
+from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
-from django.db import transaction, models
+from django.db.models import Q
 
-from rest_framework import viewsets, status, permissions, generics
+from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
+from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser
 
-from .models import ProjectCategory, ProjectTag, Project, UserProject
-from .serializers import (
-    ProjectCategorySerializer, ProjectTagSerializer, ProjectSerializer,
-    UserProjectSerializer, UserProjectStartSerializer, UserProjectSubmitSerializer
+# Django Filters
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.filters import SearchFilter, OrderingFilter
+
+from .models import (
+    ProjectTag, Project, UserProject, ProjectSubmission, ProjectAssessment
 )
-# Assuming AI Project Generator Agent has an API client or function
-# from ..ai_agents.project_generator_client import request_project_assessment, suggest_new_project
+from .serializers import (
+    ProjectTagSerializer,
+    ProjectListSerializer, ProjectDetailSerializer,
+    UserProjectListSerializer, UserProjectDetailSerializer,
+    ProjectSubmissionSerializer,
+    ProjectAssessmentSerializer
+)
+from .permissions import (
+    IsAdminOrReadOnlyForTags, IsProjectCreatorOrAdminOrReadOnly,
+    IsUserProjectOwner, CanSubmitToUserProject,
+    IsAssessmentViewerOrAdmin, CanManageProjectAssessment
+)
 
-class ProjectCategoryViewSet(viewsets.ReadOnlyModelViewSet):
+class ProjectTagViewSet(viewsets.ModelViewSet):
     """
-    API endpoint for listing project categories.
-    /api/projects/categories/ 
+    API endpoint for managing project tags.
+    Admin users can create, update, delete. All users can list and retrieve.
     """
-    queryset = ProjectCategory.objects.all()
-    serializer_class = ProjectCategorySerializer
-    permission_classes = [permissions.AllowAny]
-
-class ProjectTagViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    API endpoint for listing project tags.
-    (Implied, useful for filtering)
-    """
-    queryset = ProjectTag.objects.all()
+    queryset = ProjectTag.objects.all().order_by('name')
     serializer_class = ProjectTagSerializer
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [IsAdminOrReadOnlyForTags]
+    lookup_field = 'slug'
+    filter_backends = [SearchFilter, OrderingFilter]
+    search_fields = ['name']
+    ordering_fields = ['name', 'created_at']
 
-class ProjectViewSet(viewsets.ReadOnlyModelViewSet): # Platform projects are generally read-only by users
+
+class ProjectViewSet(viewsets.ModelViewSet):
     """
-    API endpoint for listing and retrieving available projects.
-    /api/projects/ 
-    /api/projects/{project_slug}/ 
+    API endpoint for managing project definitions.
+    - List/Retrieve: Published projects are visible to all. Unpublished only to creator/admin.
+    - Create/Update/Delete: Restricted to project creator or admin.
     """
-    queryset = Project.objects.filter(is_published=True).select_related('category', 'created_by').prefetch_related('tags', 'associated_courses')
-    serializer_class = ProjectSerializer
-    permission_classes = [permissions.AllowAny]
+    queryset = Project.objects.all() # Base queryset
+    permission_classes = [IsProjectCreatorOrAdminOrReadOnly] # Handles most cases
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = {
+        'difficulty_level': ['exact', 'in'],
+        'technologies_used__slug': ['exact', 'in'],
+        'ai_generated': ['exact'],
+        'created_by__username': ['exact'],
+    }
+    search_fields = ['title', 'description', 'technologies_used__name']
+    ordering_fields = ['title', 'difficulty_level', 'estimated_duration_hours', 'created_at', 'updated_at']
     lookup_field = 'slug'
 
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        
-        # Filtering
-        category_slug = self.request.query_params.get('category')
-        tag_slugs = self.request.query_params.getlist('tag') # ?tag=python&tag=api
-        difficulty = self.request.query_params.get('difficulty')
-        search_term = self.request.query_params.get('search')
-
-        if category_slug:
-            queryset = queryset.filter(category__slug=category_slug)
-        if tag_slugs:
-            queryset = queryset.filter(tags__slug__in=tag_slugs).distinct()
-        if difficulty:
-            queryset = queryset.filter(difficulty_level=difficulty)
-        if search_term:
-            queryset = queryset.filter(
-                models.Q(title__icontains=search_term) |
-                models.Q(subtitle__icontains=search_term) |
-                models.Q(description_html__icontains=search_term) |
-                models.Q(tags__name__icontains=search_term)
-            ).distinct()
-            
-        return queryset
-
-    @action(detail=False, methods=['get'], url_path='suggestions', permission_classes=[permissions.IsAuthenticated])
-    def suggestions(self, request):
-        """
-        Endpoint for AI-powered project suggestions.
-        /api/projects/suggestions/ 
-        This would call the AI Project Generator agent.
-        """
-        user = request.user
-        # TODO: Call AI Project Generator Agent
-        # ai_suggested_projects_data = suggest_new_project(user_profile=user.profile) # Assuming user.profile has relevant data
-        
-        # For now, returning some featured or recent platform projects as placeholder
-        suggested_projects = Project.objects.filter(is_published=True, is_featured=True).order_by('?')[:5] # Random 5 featured
-        if not suggested_projects.exists():
-            suggested_projects = Project.objects.filter(is_published=True).order_by('-created_at')[:5]
-
-        serializer = self.get_serializer(suggested_projects, many=True, context={'request': request})
-        return Response(serializer.data)
-
-    # Admin/AI might need to POST to /api/projects/ to create new projects
-    # For that, this ViewSet would not be ReadOnlyModelViewSet.
-    # def perform_create(self, serializer):
-    #     # If an AI agent is creating, it might not have a user session.
-    #     # Or, use a dedicated service account or specific auth for AI agent.
-    #     serializer.save(created_by=self.request.user if self.request.user.is_authenticated else None, project_source='ai_generated')
-
-
-class UserProjectViewSet(viewsets.ModelViewSet): # Allows create (start), retrieve, update (submit), list
-    """
-    API endpoint for managing user's projects (their instances/attempts).
-    List user's projects: /api/projects/my-projects/ (maps to list action here)
-    Start a project: (POST to this viewset with project_id, creating a UserProject instance)
-    Retrieve a user's project: /api/projects/my-projects/{user_project_id}/
-    """
-    serializer_class = UserProjectSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return ProjectListSerializer
+        return ProjectDetailSerializer
 
     def get_queryset(self):
-        # Users can only see their own UserProject instances
-        return UserProject.objects.filter(user=self.request.user).select_related(
-            'project__category', 'project__created_by', 'user'
-        ).prefetch_related('project__tags', 'project__associated_courses').order_by('-last_accessed_at')
+        user = self.request.user
+        if user.is_authenticated and user.is_staff:
+            return Project.objects.all().select_related('created_by').prefetch_related('technologies_used')
+        
+        # For list view, show published OR user's own unpublished projects
+        if self.action == 'list' and user.is_authenticated:
+            return Project.objects.filter(
+                Q(is_published=True) | Q(created_by=user)
+            ).select_related('created_by').prefetch_related('technologies_used').distinct()
+        
+        # For retrieve, permissions will handle unpublished. Default to published for anonymous.
+        if self.action == 'retrieve' or not user.is_authenticated:
+             return Project.objects.filter(is_published=True).select_related('created_by').prefetch_related('technologies_used')
+
+        # Default for authenticated users (e.g. if they are trying to access a direct non-list/retrieve action)
+        return Project.objects.filter(is_published=True).select_related('created_by').prefetch_related('technologies_used')
+
 
     def perform_create(self, serializer):
-        # This is called when a user "starts" a project.
-        # The project_id should be in the request data.
-        project_id = serializer.validated_data.get('project').id # project comes from validated_data
-        project = get_object_or_404(Project, id=project_id, is_published=True)
+        # If created_by is not in serializer (e.g. not admin setting it), set to current user.
+        # Serializer's create method already handles this logic.
+        serializer.save() # created_by is handled in serializer context
 
-        # Check if UserProject already exists
-        if UserProject.objects.filter(user=self.request.user, project=project).exists():
-            raise DRFValidationError(_("You have already started this project."))
-        
-        serializer.save(user=self.request.user, project=project, status='active', started_at=timezone.now())
-
-    # Custom action to "start" a project if preferred over direct POST to list endpoint
-    @action(detail=False, methods=['post'], url_path='start-project', serializer_class=serializers.DictField) # Expects {"project_id": "uuid"}
-    def start_project(self, request):
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated], url_path='start-project', url_name='start-project')
+    def start_project(self, request, slug=None):
         """
-        Explicit endpoint to start a project.
-        POST /api/projects/my-projects/start-project/
-        Body: { "project_id": "..." }
-        /api/projects/{project_slug}/start/ - this maps here conceptually.
+        Allows an authenticated user to start a project (creates a UserProject instance).
         """
-        project_id = request.data.get('project_id')
-        if not project_id:
-            return Response({'detail': 'project_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        project = get_object_or_404(Project, id=project_id, is_published=True)
-        user = request.user
+        project_definition = self.get_object() # Gets the Project instance, permission checks done
 
-        user_project, created = UserProject.objects.get_or_create(
-            user=user,
-            project=project,
-            defaults={'status': 'active', 'started_at': timezone.now()}
-        )
+        if not project_definition.is_published:
+            return Response({'detail': _('This project is not published and cannot be started.')}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not created and user_project.status == 'not_started': # If it existed as 'not_started'
-            user_project.status = 'active'
+        # UserProjectDetailSerializer handles validation for existing UserProject
+        user_project_data = {'project_id': project_definition.id, 'status': 'in_progress'}
+        context = {'request': request}
+        user_project_serializer = UserProjectDetailSerializer(data=user_project_data, context=context)
+
+        if user_project_serializer.is_valid():
+            user_project = user_project_serializer.save(user=request.user) # Explicitly pass user
+            return Response(UserProjectDetailSerializer(user_project, context=context).data, status=status.HTTP_201_CREATED)
+        return Response(user_project_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class UserProjectViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for users to manage their instances of projects.
+    - Users can list/retrieve/update their own UserProjects.
+    - Admins can manage all UserProjects.
+    """
+    serializer_class = UserProjectDetailSerializer # Detail for retrieve/update
+    permission_classes = [IsAuthenticated, IsUserProjectOwner] # IsUserProjectOwner for object-level
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_staff: # Admins see all
+            return UserProject.objects.all().select_related('user', 'project__created_by').prefetch_related('project__technologies_used')
+        # Regular users see only their own projects
+        return UserProject.objects.filter(user=user).select_related('user', 'project__created_by').prefetch_related('project__technologies_used')
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return UserProjectListSerializer
+        return UserProjectDetailSerializer
+
+    def perform_create(self, serializer):
+        # Creation typically via ProjectViewSet's 'start-project' action.
+        # If direct creation is allowed here, ensure project_id is validated and user is set.
+        # This assumes 'project_id' is in validated_data.
+        serializer.save(user=self.request.user)
+
+    def perform_update(self, serializer):
+        # User can update fields like repository_url, live_url, or status (e.g., to 'in_progress')
+        # Ensure they can't change the 'user' or 'project' fields after creation.
+        # Serializer read_only_fields should handle this.
+        # If status is changed to 'in_progress', model's save method handles started_at.
+        user_project = serializer.save()
+        if 'status' in serializer.validated_data and serializer.validated_data['status'] == 'in_progress' and not user_project.started_at:
             user_project.started_at = timezone.now()
-            user_project.save()
-        elif not created: # Already started or in another state
-             return Response({'detail': _(f"You have already an instance of this project with status: {user_project.get_status_display()}.")}, status=status.HTTP_400_BAD_REQUEST)
-
-        serializer = UserProjectSerializer(user_project, context={'request': request})
-        return Response(serializer.data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+            user_project.save(update_fields=['started_at'])
 
 
-    @action(detail=True, methods=['post'], url_path='submit', serializer_class=UserProjectSubmitSerializer)
-    def submit_project(self, request, pk=None):
-        """
-        Endpoint for user to submit their project for assessment.
-        POST /api/projects/my-projects/{user_project_id}/submit/
-        /api/projects/{project_slug}/submit/ maps here. pk is UserProject id.
-        """
-        user_project = self.get_object() # Ensures it's the user's own project
+class ProjectSubmissionViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for managing project submissions.
+    - Users can create submissions for their UserProjects.
+    - Users can list/retrieve their own submissions.
+    - Admins/Instructors might view submissions related to projects they manage.
+    """
+    serializer_class = ProjectSubmissionSerializer
+    permission_classes = [IsAuthenticated, CanSubmitToUserProject] # CanSubmitToUserProject for create and object-level
+
+    def get_queryset(self):
+        user = self.request.user
+        # Filter by user_project_pk from URL if provided (for nested routes)
+        user_project_pk = self.kwargs.get('user_project_pk')
+
+        if user.is_staff: # Admins see all (or all for a specific user_project if nested)
+            if user_project_pk:
+                return ProjectSubmission.objects.filter(user_project_id=user_project_pk).select_related('user_project__user', 'user_project__project')
+            return ProjectSubmission.objects.all().select_related('user_project__user', 'user_project__project')
         
-        if user_project.status not in ['active', 'completed_failed']: # Can resubmit if failed
-            return Response({'detail': _(f"Project cannot be submitted with status: {user_project.get_status_display()}")}, status=status.HTTP_400_BAD_REQUEST)
+        # Regular users see only their own submissions
+        base_qs = ProjectSubmission.objects.filter(user_project__user=user)
+        if user_project_pk:
+            return base_qs.filter(user_project_id=user_project_pk).select_related('user_project__user', 'user_project__project')
+        return base_qs.select_related('user_project__user', 'user_project__project')
 
-        submit_serializer = self.get_serializer(data=request.data)
-        submit_serializer.is_valid(raise_exception=True)
-        submission_data = submit_serializer.validated_data
+    def perform_create(self, serializer):
+        user_project_id = serializer.validated_data['user_project'].id # From source='user_project'
+        user_project = get_object_or_404(UserProject, id=user_project_id, user=self.request.user)
+        
+        # CanSubmitToUserProject permission class already checks if user can submit to this user_project.
+        # The permission class uses view.kwargs.get('user_project_pk') or request.data.get('user_project')
+        # Ensure the permission has access to the user_project object for its checks.
+        # Here, we explicitly check ownership again for safety before saving.
+        if user_project.user != self.request.user:
+             raise PermissionDenied(_("You can only submit to your own assigned projects."))
 
-        with transaction.atomic():
-            user_project.status = 'submitted'
-            user_project.submitted_at = timezone.now()
-            # Save submission data
-            if 'submission_files' in submission_data:
-                user_project.submission_data_json = {'files': submission_data['submission_files']}
-            elif 'repository_url' in submission_data:
-                user_project.project_repository_url = submission_data['repository_url']
-                user_project.submission_data_json = {'repository_url': submission_data['repository_url']} # Also store in JSON if preferred
-            elif 'submission_data' in submission_data:
-                 user_project.submission_data_json = submission_data['submission_data']
+        # Model's save() method handles updating UserProject status to 'submitted' and versioning.
+        serializer.save() # user_project is already set in validated_data
 
-            user_project.save()
+    # Update/Delete of submissions might be restricted, especially after assessment.
+    # Current CanSubmitToUserProject allows owner to delete/update their own.
 
-            # TODO: Trigger AI Assessment Agent
-            # assessment_result = request_project_assessment(
-            #     user_project_id=user_project.id,
-            #     project_spec=user_project.project.ai_generated_spec_json or user_project.project.description_html,
-            #     submission_data=user_project.submission_data_json or user_project.project_repository_url
-            # )
-            # This call would be asynchronous, and the AI agent would update the UserProject via another API endpoint or callback.
-            # For now, we'll simulate an immediate response or a pending state.
+
+class ProjectAssessmentViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for managing project assessments.
+    - Users can retrieve assessments for their submissions.
+    - Admins/AI can create/update assessments.
+    """
+    queryset = ProjectAssessment.objects.all().select_related(
+        'submission__user_project__user',
+        'submission__user_project__project',
+        'manual_assessor'
+    )
+    serializer_class = ProjectAssessmentSerializer
+    # Permissions are more nuanced here
+    # Create/Update: CanManageProjectAssessment (Admins/Staff/AI Service Role)
+    # Retrieve/List: IsAssessmentViewerOrAdmin (User who owns project, Assessor, Admin)
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), CanManageProjectAssessment()]
+        # For list/retrieve
+        return [IsAuthenticated(), IsAssessmentViewerOrAdmin()] # IsAssessmentViewerOrAdmin is object-level
+
+    def get_queryset(self):
+        user = self.request.user
+        # Filter by submission_pk from URL if provided (for nested routes)
+        submission_pk = self.kwargs.get('submission_pk')
+
+        if user.is_staff: # Admins see all
+            if submission_pk:
+                return ProjectAssessment.objects.filter(submission_id=submission_pk)
+            return ProjectAssessment.objects.all()
+        
+        # Regular users see only assessments for their own project submissions
+        # Or if they are a manual assessor (though less common for listing all they assessed)
+        base_qs = ProjectAssessment.objects.filter(
+            Q(submission__user_project__user=user) | Q(manual_assessor=user)
+        ).distinct()
+
+        if submission_pk:
+            return base_qs.filter(submission_id=submission_pk)
+        return base_qs
+
+    def perform_create(self, serializer):
+        # AI agent or Admin creates this.
+        # Serializer's create method can handle setting manual_assessor if applicable.
+        # Model's save() method handles updating UserProject status.
+        serializer.save()
+
+    def perform_update(self, serializer):
+        # Model's save() method handles updating UserProject status.
+        serializer.save()
+
+    # Custom action for AI to submit assessment (could be a separate endpoint too)
+    @action(detail=False, methods=['post'], permission_classes=[CanManageProjectAssessment], # Or a specific AI service permission
+            url_path='submit-ai-assessment', url_name='submit-ai-assessment')
+    def submit_ai_assessment(self, request):
+        """
+        An endpoint specifically for an AI agent to submit an assessment.
+        Expects submission_id and assessment data.
+        """
+        serializer = self.get_serializer(data=request.data, context={'request': request}) # ProjectAssessmentSerializer
+        if serializer.is_valid():
+            # Ensure AI details are set if not in payload but implied by endpoint
+            if 'assessed_by_ai' not in serializer.validated_data:
+                 serializer.validated_data['assessed_by_ai'] = True
+            # if 'assessor_ai_agent_name' not in serializer.validated_data and hasattr(settings, 'DEFAULT_AI_ASSESSOR_NAME'):
+            #      serializer.validated_data['assessor_ai_agent_name'] = settings.DEFAULT_AI_ASSESSOR_NAME
             
-            # Placeholder: If assessment is synchronous and fast (unlikely for complex AI)
-            # user_project.assessment_score = assessment_result.get('score')
-            # user_project.assessment_feedback_html = assessment_result.get('feedback')
-            # if user_project.assessment_score >= 75:
-            #     user_project.status = 'completed_passed'
-            # else:
-            #     user_project.status = 'completed_failed'
-            #     # TODO: Trigger AI Tutor with context (user_project.id, assessment_feedback_html)
-            # user_project.completed_at = timezone.now()
-            # user_project.save()
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(
-            UserProjectSerializer(user_project, context={'request': request}).data,
-            status=status.HTTP_200_OK
-        )
-
-    # Endpoint for AI Agent to post assessment results
-    @action(detail=True, methods=['post'], url_path='update-assessment', permission_classes=[permissions.AllowAny]) # Or a specific service account permission
-    def update_assessment_results(self, request, pk=None):
-        # This endpoint should be secured, e.g., IP whitelist, secret key, or service account auth
-        user_project = get_object_or_404(UserProject, pk=pk)
-        
-        score = request.data.get('assessment_score')
-        feedback_html = request.data.get('assessment_feedback_html')
-        # raw_ai_output = request.data.get('ai_assessment_details_json') # Optional
-
-        if score is None or feedback_html is None:
-            return Response({'detail': 'assessment_score and assessment_feedback_html are required.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            score = float(score)
-            if not (0 <= score <= 100):
-                raise ValueError("Score out of range")
-        except ValueError:
-             return Response({'detail': 'Invalid assessment_score value.'}, status=status.HTTP_400_BAD_REQUEST)
-
-
-        with transaction.atomic():
-            user_project.assessment_score = score
-            user_project.assessment_feedback_html = feedback_html
-            # user_project.ai_assessment_details_json = raw_ai_output
-            user_project.completed_at = timezone.now()
-
-            if score >= 75:
-                user_project.status = 'completed_passed'
-            else:
-                user_project.status = 'completed_failed'
-                # TODO: Trigger AI Tutor. This could be a signal handler on UserProject save
-                # or an explicit call here if the AI Tutor has an API.
-                # trigger_ai_tutor(user_id=user_project.user.id, project_id=user_project.project.id,
-                #                  user_project_id=user_project.id, feedback=feedback_html)
-                print(f"AI Tutor should be triggered for UserProject {user_project.id} due to score {score}")
-
-            user_project.save()
-        
-        return Response({'status': 'assessment updated'}, status=status.HTTP_200_OK)
