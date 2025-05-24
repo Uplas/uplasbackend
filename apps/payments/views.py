@@ -1,482 +1,499 @@
+import stripe # Stripe Python library
 from django.conf import settings
 from django.shortcuts import get_object_or_404
+from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
-from datetime import datetime
-from django.db import transaction # Import transaction
-import stripe
+from django.db import transaction # For atomic operations
 
-from rest_framework import generics, viewsets, status, permissions
-from rest_framework.views import APIView
-from rest_framework.response import Response
+from rest_framework import viewsets, status, generics, views
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError, NotFound
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser
 
-from .models import SubscriptionPlan, UserSubscription, Transaction
-from .serializers import (
-    SubscriptionPlanSerializer, UserSubscriptionSerializer, TransactionSerializer,
-    CreateSubscriptionCheckoutSessionSerializer
-    # StripeWebhookEventSerializer is conceptual, not directly used for request validation here
+from .models import (
+    SubscriptionPlan,
+    UserSubscription,
+    PaymentTransaction
 )
-from django.contrib.auth import get_user_model # Use get_user_model
+from .serializers import (
+    SubscriptionPlanSerializer,
+    UserSubscriptionSerializer,
+    CreateSubscriptionSerializer,
+    CancelSubscriptionSerializer,
+    PaymentTransactionSerializer,
+    StripeWebhookEventSerializer # For initial validation of webhook payload
+)
+from .permissions import (
+    IsSubscriptionOwner,
+    IsPaymentTransactionOwner,
+    CanManageSubscription
+)
 
-User = get_user_model()
+# Initialize Stripe API with your secret key
+stripe.api_key = settings.STRIPE_SECRET_KEY
 
-# Initialize Stripe API client (ensure keys are in settings)
-if hasattr(settings, 'STRIPE_SECRET_KEY') and settings.STRIPE_SECRET_KEY:
-    stripe.api_key = settings.STRIPE_SECRET_KEY
-else:
-    # This will cause errors if Stripe is actually called.
-    # For GitHub-only phase, we'll mock Stripe calls in tests.
-    print("WARNING: STRIPE_SECRET_KEY is not set in Django settings.")
-    stripe.api_key = "sk_test_yourstripek...." # Fallback dummy key for module to load
-
-STRIPE_WEBHOOK_SECRET = getattr(settings, 'STRIPE_WEBHOOK_SECRET_PAYMENTS', None)
-if not STRIPE_WEBHOOK_SECRET:
-    print("WARNING: STRIPE_WEBHOOK_SECRET_PAYMENTS is not set. Webhook verification will fail.")
 
 class SubscriptionPlanViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    API endpoint to list and retrieve available subscription plans.
+    Management (create, update, delete) of plans is typically done via Django admin
+    or a separate admin-only API if needed, as these are critical and less frequently changed.
+    If admin API management is needed, change to ModelViewSet and add IsAdminUser permission.
+    """
     queryset = SubscriptionPlan.objects.filter(is_active=True).order_by('display_order', 'price')
     serializer_class = SubscriptionPlanSerializer
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [AllowAny] # Anyone can see available plans
+    lookup_field = 'id' # Or 'slug' if you add a slug field
 
-class UserSubscriptionViewSet(viewsets.ReadOnlyModelViewSet): # User can only read their own sub
+
+class UserSubscriptionViewSet(viewsets.GenericViewSet): # Not a full ModelViewSet
+    """
+    API endpoint for users to manage their subscription.
+    - Retrieve current subscription.
+    - Create a new subscription (initiates Stripe Checkout or PaymentIntent flow).
+    - Cancel a subscription.
+    """
     serializer_class = UserSubscriptionSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        # A user has one primary subscription via OneToOneField 'subscription' on User model
-        # or if UserSubscription.user is OneToOneField.
-        # If UserSubscription.user is ForeignKey, then filter by user.
-        # Based on our model: user = models.OneToOneField(User, ..., related_name='subscription')
-        # So, a user can only have one UserSubscription object.
-        user_subscription = getattr(self.request.user, 'subscription', None)
-        if user_subscription:
-            return UserSubscription.objects.filter(pk=user_subscription.pk).select_related('plan', 'user')
-        return UserSubscription.objects.none() # Return empty queryset if no subscription
+        # Users can only see their own subscription.
+        return UserSubscription.objects.filter(user=self.request.user)
 
-    def list(self, request, *args, **kwargs): # Effectively a retrieve for the user's single subscription
-        instance = self.get_queryset().first() # Get the first (and only) item
-        if not instance:
-            return Response({"detail": _("No active subscription found.")}, status=status.HTTP_404_NOT_FOUND)
-        serializer = self.get_serializer(instance)
-        return Response(serializer.data)
-
-    @action(detail=False, methods=['post'], url_path='cancel-subscription') # Changed from 'cancel' to avoid conflict with potential 'cancel' named resource
-    def cancel_my_subscription(self, request, *args, **kwargs): # Renamed for clarity
-        user_sub = self.get_queryset().filter(status__in=['active', 'trialing', 'past_due', 'unpaid']).first()
-        if not user_sub:
-            return Response({'detail': _('No active or resumable subscription to cancel.')}, status=status.HTTP_404_NOT_FOUND)
-
-        if not user_sub.stripe_subscription_id:
-            # This might be an internal subscription or one not managed by Stripe.
-            # Handle manually or disallow cancellation via this API for such cases.
-            user_sub.status = 'canceled'
-            user_sub.cancel_at_period_end = False # Immediate cancel for non-Stripe
-            user_sub.canceled_at = timezone.now()
-            user_sub.ended_at = timezone.now() # Mark as ended
-            user_sub.save()
-            # User model update will be handled by user_sub.save()
-            return Response({'detail': _('Subscription marked as canceled internally.')}, status=status.HTTP_200_OK)
-
+    @action(detail=False, methods=['get'], url_path='my-subscription', url_name='my-subscription')
+    def get_my_subscription(self, request):
+        """
+        Retrieves the current authenticated user's active subscription.
+        """
         try:
-            # For Stripe, it's best to cancel at period end to allow user to use remaining time.
-            stripe.Subscription.modify(
-                user_sub.stripe_subscription_id,
-                cancel_at_period_end=True
-            )
-            user_sub.cancel_at_period_end = True
-            # Status update to 'canceled' will come via webhook when period actually ends.
-            # We are just recording the intent here.
-            user_sub.save(update_fields=['cancel_at_period_end', 'updated_at'])
-            return Response({'detail': _('Your subscription is set to cancel at the end of the current billing period.')}, status=status.HTTP_200_OK)
-        except stripe.error.StripeError as e:
-            # Log the error: print(f"Stripe error during cancel_my_subscription: {e}")
-            return Response({'detail': _(f'Could not request cancellation with payment provider: {str(e)} Please try again or contact support.')}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            # Log the error: print(f"Unexpected error during cancel_my_subscription: {e}")
-            return Response({'detail': _('An unexpected error occurred. Please try again later.')}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            subscription = UserSubscription.objects.select_related('plan').get(user=request.user)
+            # Could add logic here to refresh from Stripe if needed, or rely on webhooks
+            serializer = self.get_serializer(subscription)
+            return Response(serializer.data)
+        except UserSubscription.DoesNotExist:
+            return Response({'detail': _('No active subscription found.')}, status=status.HTTP_404_NOT_FOUND)
 
+    @action(detail=False, methods=['post'], url_path='create-subscription', url_name='create-subscription',
+            serializer_class=CreateSubscriptionSerializer)
+    def create_subscription(self, request):
+        """
+        Creates a new Stripe subscription for the user.
+        Expects 'plan_id' and 'payment_method_id' (from Stripe Elements on frontend).
+        This is one way to handle subscriptions (PaymentIntents with SetupIntents).
+        Another way is Stripe Checkout.
+        """
+        serializer = CreateSubscriptionSerializer(data=request.data, context={'request': request})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-class TransactionViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = TransactionSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return Transaction.objects.filter(user=self.request.user).select_related(
-            'user_subscription__plan' # For basic plan info if nested in serializer
-        ).order_by('-processed_at', '-created_at')
-
-
-class CreateCheckoutSessionView(generics.GenericAPIView):
-    serializer_class = CreateSubscriptionCheckoutSessionSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        plan_id = serializer.validated_data['plan_id'] # This is already validated to be a valid UUID
-        success_url = serializer.validated_data['success_url']
-        cancel_url = serializer.validated_data['cancel_url']
-        
+        plan = serializer.validated_data['plan_id'] # This is the plan object from validation
+        payment_method_id = serializer.validated_data['payment_method_id']
         user = request.user
-        try:
-            plan = SubscriptionPlan.objects.get(id=plan_id, is_active=True) # Already validated by serializer, but good to fetch
-        except SubscriptionPlan.DoesNotExist: # Should not happen if serializer validation is correct
-            raise NotFound(_("Selected subscription plan not found or is inactive."))
 
-        if not plan.stripe_price_id: # Also validated by serializer
-             raise DRFValidationError(_("This plan is not configured for online payment."))
-
-        stripe_customer_id = user.stripe_customer_id
-        
-        if not stripe_customer_id:
-            try:
-                customer_params = {
-                    'email': user.email,
-                    'name': user.full_name or user.username,
-                    'metadata': {'uplas_user_id': str(user.id)}
-                }
-                # Add address, phone if collected and useful for Stripe/tax
-                # if user.country and hasattr(settings, 'STRIPE_SUPPORTED_COUNTRIES_FOR_ADDRESS') and user.country in settings.STRIPE_SUPPORTED_COUNTRIES_FOR_ADDRESS:
-                #     customer_params['address'] = {'country': user.country, 'city': user.city}
-
-                customer = stripe.Customer.create(**customer_params)
-                stripe_customer_id = customer.id
-                user.stripe_customer_id = stripe_customer_id
-                user.save(update_fields=['stripe_customer_id'])
-            except stripe.error.StripeError as e:
-                # Log error: print(f"Stripe customer creation error: {e}")
-                return Response({'error': _(f'Could not set up payment profile: {str(e)}')}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
-        line_items = [{'price': plan.stripe_price_id, 'quantity': 1}]
-        checkout_session_params = {
-            'customer': stripe_customer_id,
-            'payment_method_types': ['card'], # Or ['card', 'paypal'], etc.
-            'line_items': line_items,
-            'mode': 'subscription', # For recurring plans
-            'success_url': success_url + '?session_id={CHECKOUT_SESSION_ID}', # Pass session ID back
-            'cancel_url': cancel_url,
-            'metadata': {
-                'uplas_user_id': str(user.id),
-                'uplas_plan_id': str(plan.id),
-            }
-        }
-        # Handle trials if the plan is a trial plan or if you have trial logic
-        # if plan.has_trial_period: # Assuming a field on SubscriptionPlan model
-        #    checkout_session_params['subscription_data'] = {'trial_period_days': plan.trial_days}
+        # Check if user already has an active subscription (if only one is allowed)
+        if UserSubscription.objects.filter(user=user, status__in=['active', 'trialing', 'past_due']).exists():
+            return Response({'detail': _('You already have an active subscription.')}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            checkout_session = stripe.checkout.Session.create(**checkout_session_params)
+            # 1. Get or create a Stripe Customer for this user
+            stripe_customer_id = None
+            if hasattr(user, 'userprofile') and user.userprofile.stripe_customer_id: # Assuming stripe_customer_id on UserProfile
+                stripe_customer_id = user.userprofile.stripe_customer_id
             
-            # Optionally, pre-create a UserSubscription record with 'incomplete' status.
-            # This helps track initiated checkouts.
-            UserSubscription.objects.update_or_create(
-                user=user, # Since user is OneToOne with UserSubscription
-                defaults={
-                    'plan': plan,
-                    'stripe_customer_id': stripe_customer_id, # Store customer ID with the sub attempt
-                    'status': 'incomplete', 
-                    # 'stripe_checkout_session_id': checkout_session.id, # Add this field to UserSubscription if needed
-                    'current_period_start': None, # Will be set by webhook
-                    'current_period_end': None,   # Will be set by webhook
-                }
+            if not stripe_customer_id:
+                customer = stripe.Customer.create(
+                    email=user.email,
+                    name=user.full_name or user.username, # Ensure your User model has full_name
+                    payment_method=payment_method_id,
+                    invoice_settings={'default_payment_method': payment_method_id},
+                    metadata={'django_user_id': str(user.id)}
+                )
+                stripe_customer_id = customer.id
+                # Save stripe_customer_id to your UserProfile model
+                if hasattr(user, 'userprofile'):
+                    user.userprofile.stripe_customer_id = stripe_customer_id
+                    user.userprofile.save()
+                else: # Fallback or error if UserProfile doesn't exist
+                    print(f"Warning: User {user.id} does not have a UserProfile to save Stripe Customer ID.")
+
+            else: # Customer exists, attach payment method
+                stripe.PaymentMethod.attach(payment_method_id, customer=stripe_customer_id)
+                stripe.Customer.modify(stripe_customer_id, invoice_settings={'default_payment_method': payment_method_id})
+
+
+            # 2. Create the Stripe Subscription
+            stripe_subscription = stripe.Subscription.create(
+                customer=stripe_customer_id,
+                items=[{'price': plan.stripe_price_id}],
+                expand=['latest_invoice.payment_intent', 'pending_setup_intent'],
+                # trial_period_days=plan.trial_days if plan.trial_days else None, # If your plan model has trial_days
+                # payment_behavior='default_incomplete' if SCA is required
+                # off_session=True, # If payment is off-session
             )
-            return Response({'checkout_session_id': checkout_session.id, 'checkout_url': checkout_session.url}, status=status.HTTP_200_OK)
+
+            # 3. Create UserSubscription record in your DB
+            # Important: Most fields will be updated by webhooks (status, current_period_end, etc.)
+            # This initial record is a placeholder.
+            with transaction.atomic():
+                user_sub, created = UserSubscription.objects.update_or_create(
+                    user=user,
+                    defaults={ # Use defaults to update if an inactive one exists
+                        'plan': plan,
+                        'stripe_subscription_id': stripe_subscription.id,
+                        'stripe_customer_id': stripe_customer_id,
+                        'status': stripe_subscription.status, # Initial status from Stripe
+                        'current_period_start': timezone.datetime.fromtimestamp(stripe_subscription.current_period_start, tz=timezone.utc) if stripe_subscription.current_period_start else None,
+                        'current_period_end': timezone.datetime.fromtimestamp(stripe_subscription.current_period_end, tz=timezone.utc) if stripe_subscription.current_period_end else None,
+                        'trial_start': timezone.datetime.fromtimestamp(stripe_subscription.trial_start, tz=timezone.utc) if stripe_subscription.trial_start else None,
+                        'trial_end': timezone.datetime.fromtimestamp(stripe_subscription.trial_end, tz=timezone.utc) if stripe_subscription.trial_end else None,
+                    }
+                )
+            
+            # Handle PaymentIntent if immediate payment is required and successful
+            # Or if it requires action (e.g., 3D Secure)
+            latest_invoice = stripe_subscription.latest_invoice
+            payment_intent = latest_invoice.payment_intent if latest_invoice else None
+            
+            response_data = {
+                'subscription_id': user_sub.id,
+                'stripe_subscription_id': stripe_subscription.id,
+                'status': stripe_subscription.status
+            }
+
+            if payment_intent:
+                response_data['payment_intent_status'] = payment_intent.status
+                if payment_intent.status == 'requires_action' or payment_intent.status == 'requires_payment_method':
+                    response_data['payment_intent_client_secret'] = payment_intent.client_secret
+                elif payment_intent.status == 'succeeded':
+                    # Create a PaymentTransaction record here or wait for webhook
+                    PaymentTransaction.objects.create(
+                        user=user,
+                        user_subscription=user_sub,
+                        stripe_charge_id=payment_intent.id, # or payment_intent.latest_charge
+                        stripe_invoice_id=latest_invoice.id if latest_invoice else None,
+                        amount=Decimal(payment_intent.amount_received) / 100, # Amount is in cents
+                        currency=payment_intent.currency.upper(),
+                        status='succeeded',
+                        paid_at=timezone.datetime.fromtimestamp(payment_intent.created, tz=timezone.utc),
+                        description=f"Subscription to {plan.name}"
+                    )
+            elif stripe_subscription.pending_setup_intent: # For trials or free plans that need PM for future
+                 response_data['setup_intent_client_secret'] = stripe_subscription.pending_setup_intent.client_secret
+
+
+            return Response(response_data, status=status.HTTP_201_CREATED)
+
         except stripe.error.StripeError as e:
-            # Log error: print(f"Stripe checkout session creation error: {e}")
-            return Response({'error': _(f'Could not initiate payment session: {str(e)}')}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            # Log error: print(f"Unexpected error creating checkout session: {e}")
-            return Response({'error': _('An unexpected error occurred while initiating payment.')}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            # Log the exception e
+            return Response({'error': _('An unexpected error occurred. Please try again.')}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class StripeWebhookView(APIView):
-    permission_classes = [permissions.AllowAny]
+    @action(detail=False, methods=['post'], url_path='cancel-subscription', url_name='cancel-subscription',
+            serializer_class=CancelSubscriptionSerializer, permission_classes=[IsAuthenticated, CanManageSubscription])
+    def cancel_subscription(self, request):
+        """
+        Cancels the current authenticated user's active subscription.
+        """
+        serializer = CancelSubscriptionSerializer(data=request.data) # Validate if any params are passed
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    def _get_user_from_stripe_data(self, event_data):
-        """Helper to find Uplas user from Stripe customer ID or metadata."""
-        stripe_customer_id = event_data.get('customer')
-        user = None
-        if stripe_customer_id:
-            try:
-                user = User.objects.get(stripe_customer_id=stripe_customer_id)
-            except User.DoesNotExist:
-                 # Fallback: check metadata if customer ID wasn't on user yet (e.g., from checkout session)
-                metadata = event_data.get('metadata', {})
-                uplas_user_id = metadata.get('uplas_user_id')
-                if uplas_user_id:
-                    try:
-                        user = User.objects.get(pk=uplas_user_id)
-                        # If found via metadata and user doesn't have stripe_customer_id yet, update it
-                        if user and not user.stripe_customer_id and stripe_customer_id:
-                            user.stripe_customer_id = stripe_customer_id
-                            user.save(update_fields=['stripe_customer_id'])
-                    except User.DoesNotExist:
-                        print(f"Webhook: User with uplas_user_id {uplas_user_id} from metadata not found.")
-                else:
-                    print(f"Webhook: Stripe customer ID {stripe_customer_id} not found on any Uplas user and no uplas_user_id in metadata.")
-        return user
+        cancel_immediately = serializer.validated_data.get('cancel_immediately', False)
 
-    @transaction.atomic # Ensure all DB operations for a webhook are atomic
-    def _handle_checkout_session_completed(self, event_data):
-        session = event_data # event_data is the session object
-        print(f"Webhook: Handling checkout.session.completed for session {session.get('id')}")
-        
-        stripe_customer_id = session.get('customer')
-        stripe_subscription_id = session.get('subscription')
-        metadata = session.get('metadata', {})
-        uplas_user_id = metadata.get('uplas_user_id')
-        uplas_plan_id = metadata.get('uplas_plan_id')
-        payment_status = session.get('payment_status')
+        try:
+            user_subscription = UserSubscription.objects.get(user=request.user)
+            # Check object permission (CanManageSubscription will use this object)
+            self.check_object_permissions(request, user_subscription)
 
-        user = self._get_user_from_stripe_data(session)
-        if not user:
-            print(f"Webhook Error (checkout.session.completed): User not found for session {session.get('id')}.")
-            return # Cannot proceed without a user
+            if not user_subscription.stripe_subscription_id:
+                return Response({'detail': _('Stripe subscription ID not found.')}, status=status.HTTP_400_BAD_REQUEST)
 
-        plan = None
-        if uplas_plan_id:
-            try:
-                plan = SubscriptionPlan.objects.get(pk=uplas_plan_id)
-            except SubscriptionPlan.DoesNotExist:
-                print(f"Webhook Error (checkout.session.completed): Plan with ID {uplas_plan_id} from metadata not found.")
-                # This is problematic, might need manual intervention or a default action
+            if user_subscription.status == 'cancelled':
+                 return Response({'detail': _('Subscription is already cancelled.')}, status=status.HTTP_400_BAD_REQUEST)
 
-        if payment_status == 'paid' and stripe_subscription_id:
-            # The actual subscription record is usually created/updated by 'customer.subscription.created/updated' events.
-            # This event confirms the checkout itself. We can update our preliminary UserSubscription record.
-            user_sub, created = UserSubscription.objects.update_or_create(
-                user=user, # Relies on OneToOne user-subscription link
-                defaults={
-                    'plan': plan, # Update plan if it was preliminary
-                    'stripe_subscription_id': stripe_subscription_id,
-                    'stripe_customer_id': stripe_customer_id, # Ensure it's set
-                    # Status will be set by customer.subscription.created/updated event.
-                    # If this event comes before customer.subscription.created, set to a temp active-like state.
-                    # 'status': 'active', # Or defer to subscription event
-                    # 'current_period_start': timezone.now(), # Approximate, will be overwritten by sub event
-                    # 'current_period_end': # Cannot determine from session alone typically
-                }
-            )
-            print(f"Webhook: Checkout session {session.get('id')} processed for user {user.email}. UserSubscription {'created' if created else 'updated'}.")
-        elif payment_status != 'paid':
-            # Checkout completed but payment not successful (e.g. 'unpaid', 'no_payment_required' for trials without upfront)
-            # Update our UserSubscription to 'incomplete' or based on actual Stripe sub status if available.
-            UserSubscription.objects.filter(user=user).update(status='incomplete') # Or a more specific status
-            print(f"Webhook: Checkout session {session.get('id')} for user {user.email} completed with payment_status: {payment_status}.")
-        else:
-            print(f"Webhook: Checkout session {session.get('id')} for user {user.email} has no subscription ID (mode might not be 'subscription' or other issue).")
+            if cancel_immediately:
+                stripe.Subscription.delete(user_subscription.stripe_subscription_id)
+                # Webhook 'customer.subscription.deleted' will update local status
+            else: # Cancel at period end
+                stripe.Subscription.modify(
+                    user_subscription.stripe_subscription_id,
+                    cancel_at_period_end=True
+                )
+                user_subscription.cancel_at_period_end = True
+                user_subscription.status = 'pending_cancellation' # Local status update
+                user_subscription.save()
+                # Webhook 'customer.subscription.updated' will confirm cancel_at_period_end
+
+            return Response({'detail': _('Subscription cancellation requested successfully.')}, status=status.HTTP_200_OK)
+
+        except UserSubscription.DoesNotExist:
+            return Response({'detail': _('No active subscription found to cancel.')}, status=status.HTTP_404_NOT_FOUND)
+        except stripe.error.StripeError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            # Log e
+            return Response({'error': _('An unexpected error occurred.')}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # TODO: Add endpoint for updating payment method (Stripe Billing Portal or custom flow)
+    # @action(detail=False, methods=['post'], url_path='create-billing-portal-session', url_name='create-billing-portal')
+    # def create_billing_portal_session(self, request):
+    #     try:
+    #         user_subscription = UserSubscription.objects.get(user=request.user)
+    #         if not user_subscription.stripe_customer_id:
+    #             return Response(...)
+    #
+    #         return_url = settings.STRIPE_BILLING_PORTAL_RETURN_URL # Configure in settings
+    #         session = stripe.billing_portal.Session.create(
+    #             customer=user_subscription.stripe_customer_id,
+    #             return_url=return_url,
+    #         )
+    #         return Response({'url': session.url})
+    #     except ...
 
 
-    @transaction.atomic
-    def _handle_customer_subscription_event(self, event_data, event_type): # Handles created, updated, deleted
-        sub = event_data # event_data is the subscription object
-        print(f"Webhook: Handling {event_type} for subscription {sub.get('id')}")
-        
-        user = self._get_user_from_stripe_data(sub)
-        if not user:
-            print(f"Webhook Error ({event_type}): User not found for Stripe customer {sub.get('customer')}, subscription {sub.get('id')}.")
-            return
+class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    API endpoint for users to view their payment transaction history.
+    """
+    serializer_class = PaymentTransactionSerializer
+    permission_classes = [IsAuthenticated]
 
-        stripe_price_id = None
-        if sub.get('items') and sub['items'].get('data'):
-            # A subscription can have multiple items, typically one for simple plans.
-            # We're assuming the first item's price is the one for our SubscriptionPlan.
-            primary_item = sub['items']['data'][0] if sub['items']['data'] else None
-            if primary_item and primary_item.get('price'):
-                stripe_price_id = primary_item['price']['id']
-        
-        plan = None
-        if stripe_price_id:
-            try:
-                plan = SubscriptionPlan.objects.get(stripe_price_id=stripe_price_id)
-            except SubscriptionPlan.DoesNotExist:
-                print(f"Webhook Warning ({event_type}): Plan for Stripe Price ID {stripe_price_id} not found. Sub ID: {sub.get('id')}")
-                # You might want to create a placeholder plan or flag this for admin review.
-                # For now, we proceed, UserSubscription.plan might remain None or previous value.
+    def get_queryset(self):
+        # Users can only see their own payment transactions.
+        return PaymentTransaction.objects.filter(user=self.request.user).order_by('-created_at')
+    
+    # No create/update/delete for users, these are system-generated via webhooks.
 
-        subscription_status = sub.get('status') # e.g., active, trialing, past_due, canceled, unpaid, incomplete
-        
-        # Map Stripe status to our model's status choices if they differ significantly
-        # For now, assuming a direct mapping or similar enough terms.
-        
-        user_sub_defaults = {
-            'stripe_customer_id': sub.get('customer'),
-            'status': subscription_status,
-            'current_period_start': datetime.fromtimestamp(sub['current_period_start'], tz=timezone.utc) if sub.get('current_period_start') else None,
-            'current_period_end': datetime.fromtimestamp(sub['current_period_end'], tz=timezone.utc) if sub.get('current_period_end') else None,
-            'cancel_at_period_end': sub.get('cancel_at_period_end', False),
-            'canceled_at': datetime.fromtimestamp(sub['canceled_at'], tz=timezone.utc) if sub.get('canceled_at') else None,
-            'ended_at': datetime.fromtimestamp(sub.get('ended_at'), tz=timezone.utc) if sub.get('ended_at') else None, # For subscriptions that naturally end
-            'trial_start_date': datetime.fromtimestamp(sub['trial_start'], tz=timezone.utc) if sub.get('trial_start') else None,
-            'trial_end_date': datetime.fromtimestamp(sub['trial_end'], tz=timezone.utc) if sub.get('trial_end') else None,
-        }
-        if plan: # Only update plan if found
-            user_sub_defaults['plan'] = plan
-        
-        # Use stripe_subscription_id for uniqueness if user can have multiple past subscriptions.
-        # But our model user is OneToOneField to UserSubscription, so user is the key.
-        user_sub, created = UserSubscription.objects.update_or_create(
-            user=user, # This assumes one active subscription per user managed by this OneToOne
-            # stripe_subscription_id=sub.get('id'), # Use this if User can have multiple UserSubscription records
-            defaults=user_sub_defaults
-        )
-        
-        # If it's a new subscription being created via webhook and start_date isn't set by Stripe's 'created' field.
-        if created and sub.get('start_date') and not user_sub.start_date:
-            user_sub.start_date = datetime.fromtimestamp(sub['start_date'], tz=timezone.utc)
-            user_sub.save(update_fields=['start_date']) # User model update handled by full save
 
-        # For 'customer.subscription.deleted', Stripe sends the final state of the subscription
-        # which often has status='canceled' and 'canceled_at' set.
-        # Our logic above should handle this by updating the status and canceled_at.
-        # 'ended_at' is also important for subscriptions that complete their term.
-        
-        print(f"Webhook: UserSubscription for user {user.email} {'created' if created else 'updated'} by {event_type}. New status: {subscription_status}. Sub ID: {sub.get('id')}")
-        # user_sub.save() will trigger the update to User model's premium status.
-
-    @transaction.atomic
-    def _handle_invoice_payment_succeeded(self, event_data):
-        invoice = event_data
-        print(f"Webhook: Handling invoice.payment_succeeded for invoice {invoice.get('id')}")
-        user = self._get_user_from_stripe_data(invoice)
-        if not user:
-            print(f"Webhook Error (invoice.payment_succeeded): User not found for Stripe customer {invoice.get('customer')}.")
-            return
-
-        user_sub = None
-        if invoice.get('subscription'):
-            try: # Try to link to an existing UserSubscription record
-                user_sub = UserSubscription.objects.get(stripe_subscription_id=invoice['subscription'], user=user)
-            except UserSubscription.DoesNotExist:
-                print(f"Webhook Info (invoice.payment_succeeded): UserSubscription not found for Stripe sub ID {invoice['subscription']}. This might be the first payment for a new sub, which will be created by customer.subscription.created.")
-                # It's okay if not found, transaction can still be recorded. Subscription event will create/update UserSubscription.
-
-        # Determine transaction type
-        trans_type = 'subscription_renewal'
-        if invoice.get('billing_reason') == 'subscription_create':
-            trans_type = 'subscription_signup'
-        elif not invoice.get('subscription'): # If no subscription, could be a one-time invoice
-            trans_type = 'one_time_purchase' # Or a more generic 'payment_intent'
-
-        Transaction.objects.update_or_create(
-            # Use a unique Stripe ID from the invoice to prevent duplicate transactions for the same event
-            # Payment Intent ID is usually the best for this if available from the invoice
-            stripe_payment_intent_id=invoice.get('payment_intent'), 
-            defaults={
-                'user': user,
-                'user_subscription': user_sub,
-                'stripe_charge_id': invoice.get('charge'), # May be null if PI is used
-                'stripe_invoice_id': invoice.get('id'),
-                'transaction_type': trans_type,
-                'status': 'succeeded', # From event type
-                'amount': invoice['amount_paid'] / 100.0, # Stripe amounts are in cents
-                'currency': invoice['currency'].upper(),
-                'payment_method_details': {'card_brand': invoice.get('charge_details', {}).get('card', {}).get('brand'), # Example, structure varies
-                                           'card_last4': invoice.get('charge_details', {}).get('card', {}).get('last4')},
-                'description': invoice.get('description') or f"Payment for invoice {invoice.get('id')}",
-                'processed_at': datetime.fromtimestamp(invoice['status_transitions']['paid_at'], tz=timezone.utc) if invoice.get('status_transitions', {}).get('paid_at') else timezone.now()
-            }
-        )
-        print(f"Webhook: Transaction 'succeeded' recorded for invoice {invoice.get('id')}, user {user.email}.")
-
-    @transaction.atomic
-    def _handle_invoice_payment_failed(self, event_data):
-        invoice = event_data
-        print(f"Webhook: Handling invoice.payment_failed for invoice {invoice.get('id')}")
-        user = self._get_user_from_stripe_data(invoice)
-        if not user:
-            print(f"Webhook Error (invoice.payment_failed): User not found for Stripe customer {invoice.get('customer')}.")
-            return
-
-        user_sub = None
-        if invoice.get('subscription'):
-            try:
-                user_sub = UserSubscription.objects.get(stripe_subscription_id=invoice['subscription'], user=user)
-            except UserSubscription.DoesNotExist:
-                print(f"Webhook Info (invoice.payment_failed): UserSubscription not found for Stripe sub ID {invoice['subscription']}.")
-
-        # The subscription status (e.g., 'past_due', 'unpaid') is typically updated by 'customer.subscription.updated' event.
-        # Here we just record the failed transaction.
-        charge_error = invoice.get('last_finalization_error') or invoice.get('charge_details',{}).get('failure_details') or {} # Structure varies
-        
-        Transaction.objects.update_or_create(
-            stripe_payment_intent_id=invoice.get('payment_intent'), # Use PI if available for idempotency
-            defaults={
-                'user': user,
-                'user_subscription': user_sub,
-                'stripe_charge_id': invoice.get('charge'),
-                'stripe_invoice_id': invoice.get('id'),
-                'transaction_type': 'subscription_renewal' if user_sub else 'payment_intent',
-                'status': 'failed',
-                'amount': invoice['amount_due'] / 100.0,
-                'currency': invoice['currency'].upper(),
-                'error_message': charge_error.get('message', 'Unknown payment failure.'),
-                'processed_at': timezone.now() # Time this webhook processed the failure
-            }
-        )
-        print(f"Webhook: Transaction 'failed' recorded for invoice {invoice.get('id')}, user {user.email}.")
-        # Optionally: Send notification to user about payment failure.
+class StripeWebhookView(views.APIView):
+    """
+    Handles incoming webhooks from Stripe.
+    This endpoint should not require CSRF protection or authentication from Stripe.
+    Stripe authenticates webhooks using signatures.
+    """
+    permission_classes = [AllowAny] # Stripe does not send auth headers
 
     def post(self, request, *args, **kwargs):
-        if not STRIPE_WEBHOOK_SECRET:
-            print("Webhook Error: Stripe webhook secret is not configured.")
-            return Response({'error': 'Webhook secret not configured on server.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
         payload = request.body
         sig_header = request.META.get('HTTP_STRIPE_SIGNATURE')
-        event = None
+        endpoint_secret = settings.STRIPE_WEBHOOK_SECRET # Your webhook signing secret
 
         try:
-            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        except ValueError as e: # Invalid payload
-            print(f"Webhook ValueError: {e}")
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, endpoint_secret
+            )
+        except ValueError as e:
+            # Invalid payload
             return Response({'error': 'Invalid payload'}, status=status.HTTP_400_BAD_REQUEST)
-        except stripe.error.SignatureVerificationError as e: # Invalid signature
-            print(f"Webhook SignatureVerificationError: {e}")
+        except stripe.error.SignatureVerificationError as e:
+            # Invalid signature
             return Response({'error': 'Invalid signature'}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            print(f"Webhook general construction error: {e}")
-            return Response({'error': f'Webhook construction error: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Validate event structure (optional, but good practice)
+        event_serializer = StripeWebhookEventSerializer(data=event)
+        if not event_serializer.is_valid():
+            # Log this error, as it means Stripe sent something unexpected
+            print(f"Stripe Webhook Deserialization Error: {event_serializer.errors}")
+            # Still try to process if possible, or return 400 if strict
+            # return Response(event_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            pass
+
+
+        # Handle the event
         event_type = event['type']
-        event_data = event['data']['object'] # The Stripe object related to the event
+        data_object = event['data']['object'] # The Stripe object related to the event
 
-        # For idempotency: check if event.id has been processed before.
-        # E.g., cache processed_event_ids or store them in a simple model.
-        # If processed_event_ids.exists(event.id): return Response({'status': 'already processed'}, status=status.HTTP_200_OK)
-        
-        # Print event for debugging in development
-        # print(f"Received Stripe webhook: ID: {event.get('id')}, Type: {event_type}")
+        print(f"Received Stripe event: {event_type}, Event ID: {event.id}")
 
-        handler_map = {
-            'checkout.session.completed': self._handle_checkout_session_completed,
-            'customer.subscription.created': lambda data: self._handle_customer_subscription_event(data, 'customer.subscription.created'),
-            'customer.subscription.updated': lambda data: self._handle_customer_subscription_event(data, 'customer.subscription.updated'),
-            'customer.subscription.deleted': lambda data: self._handle_customer_subscription_event(data, 'customer.subscription.deleted'), # Stripe sends final sub object
-            'invoice.payment_succeeded': self._handle_invoice_payment_succeeded,
-            'invoice.payment_failed': self._handle_invoice_payment_failed,
-            # Add more handlers as needed:
-            # 'customer.subscription.trial_will_end': self._handle_trial_will_end,
-            # 'payment_intent.succeeded': self._handle_payment_intent_succeeded,
-            # 'payment_intent.payment_failed': self._handle_payment_intent_payment_failed,
-            # 'charge.refunded': self._handle_charge_refunded,
-        }
+        try:
+            with transaction.atomic(): # Ensure database operations are atomic for each event
+                if event_type == 'checkout.session.completed':
+                    # This event is used if you are using Stripe Checkout for one-time payments or subscriptions
+                    # session = data_object
+                    # client_reference_id = session.get('client_reference_id') # Your internal user ID
+                    # stripe_customer_id = session.get('customer')
+                    # stripe_subscription_id = session.get('subscription') # If it's a subscription checkout
+                    # payment_intent_id = session.get('payment_intent')
+                    #
+                    # user = User.objects.filter(id=client_reference_id).first()
+                    # if not user: # Or handle error
+                    #     print(f"Webhook Error: User not found for client_reference_id {client_reference_id}")
+                    #     return Response({'status': 'error', 'message': 'User not found'}, status=status.HTTP_400_BAD_REQUEST)
+                    #
+                    # if stripe_subscription_id: # It's a subscription
+                    #     # Retrieve the subscription from Stripe to get full details (like plan)
+                    #     stripe_sub = stripe.Subscription.retrieve(stripe_subscription_id)
+                    #     plan_stripe_price_id = stripe_sub.items.data[0].price.id
+                    #     plan = SubscriptionPlan.objects.filter(stripe_price_id=plan_stripe_price_id).first()
+                    #
+                    #     if not plan:
+                    #         print(f"Webhook Error: Plan not found for Stripe Price ID {plan_stripe_price_id}")
+                    #         return Response({'status': 'error', 'message': 'Plan not found'}, status=status.HTTP_400_BAD_REQUEST)
+                    #
+                    #     UserSubscription.objects.update_or_create(
+                    #         stripe_subscription_id=stripe_subscription_id,
+                    #         defaults={
+                    #             'user': user,
+                    #             'plan': plan,
+                    #             'stripe_customer_id': stripe_customer_id,
+                    #             'status': stripe_sub.status,
+                    #             'current_period_start': timezone.datetime.fromtimestamp(stripe_sub.current_period_start, tz=timezone.utc),
+                    #             'current_period_end': timezone.datetime.fromtimestamp(stripe_sub.current_period_end, tz=timezone.utc),
+                    #             'trial_start': timezone.datetime.fromtimestamp(stripe_sub.trial_start, tz=timezone.utc) if stripe_sub.trial_start else None,
+                    #             'trial_end': timezone.datetime.fromtimestamp(stripe_sub.trial_end, tz=timezone.utc) if stripe_sub.trial_end else None,
+                    #         }
+                    #     )
+                    #     print(f"Subscription created/updated for user {user.id} via checkout.")
+                    #
+                    # # Handle payment intent if present (for one-time or first subscription payment)
+                    # if payment_intent_id:
+                    #     pi = stripe.PaymentIntent.retrieve(payment_intent_id)
+                    #     if pi.status == 'succeeded':
+                    #         # Create PaymentTransaction
+                    #         PaymentTransaction.objects.update_or_create(
+                    #             stripe_charge_id=pi.id, # Using PI id as charge id
+                    #             defaults={
+                    #                 'user':user,
+                    #                 'user_subscription': UserSubscription.objects.filter(stripe_subscription_id=stripe_subscription_id).first() if stripe_subscription_id else None,
+                    #                 'amount': Decimal(pi.amount_received) / 100,
+                    #                 'currency': pi.currency.upper(),
+                    #                 'status': 'succeeded',
+                    #                 'paid_at': timezone.datetime.fromtimestamp(pi.created, tz=timezone.utc),
+                    #                 'description': session.get('metadata', {}).get('description', f"Payment via Checkout Session {session.id}")
+                    #             }
+                    #         )
+                    #         print(f"PaymentTransaction created for PI {pi.id}")
+                    pass # Implement based on your Stripe Checkout setup
 
-        handler = handler_map.get(event_type)
-        if handler:
-            try:
-                handler(event_data)
-                # Mark event as processed if using idempotency tracking
-            except Exception as e:
-                print(f"Error processing webhook event {event.get('id')} ({event_type}): {str(e)}")
-                # Consider specific logging for critical errors
-                # Return 500 so Stripe retries for transient errors.
-                # If it's a non-transient error (e.g., bad data we can't handle),
-                # you might eventually want to return 200 after logging to stop retries.
-                return Response({'error': 'Internal server error while processing webhook.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        else:
-            print(f'Webhook: Unhandled event type: {event_type}')
+                elif event_type == 'invoice.payment_succeeded':
+                    invoice = data_object
+                    stripe_subscription_id = invoice.get('subscription')
+                    stripe_customer_id = invoice.get('customer')
+                    
+                    user_sub = UserSubscription.objects.filter(stripe_subscription_id=stripe_subscription_id).first()
+                    user = User.objects.filter(userprofile__stripe_customer_id=stripe_customer_id).first() # Assumes stripe_customer_id on UserProfile
+                    if not user_sub and user: # Try to find by user if sub not yet created by that ID
+                        user_sub = UserSubscription.objects.filter(user=user).first()
+
+
+                    if user_sub:
+                        # Update subscription period
+                        user_sub.status = 'active' # Or map from invoice.subscription.status
+                        user_sub.current_period_start = timezone.datetime.fromtimestamp(invoice.period_start, tz=timezone.utc)
+                        user_sub.current_period_end = timezone.datetime.fromtimestamp(invoice.period_end, tz=timezone.utc)
+                        user_sub.save()
+
+                        # Create PaymentTransaction
+                        PaymentTransaction.objects.update_or_create(
+                            stripe_charge_id=invoice.payment_intent or invoice.charge, # Use PI if available, else charge
+                            stripe_invoice_id=invoice.id,
+                            defaults={
+                                'user': user_sub.user,
+                                'user_subscription': user_sub,
+                                'amount': Decimal(invoice.amount_paid) / 100,
+                                'currency': invoice.currency.upper(),
+                                'status': 'succeeded',
+                                'paid_at': timezone.datetime.fromtimestamp(invoice.status_transitions.paid_at, tz=timezone.utc) if invoice.status_transitions.paid_at else timezone.now(),
+                                'description': f"Invoice paid: {invoice.number or invoice.id}",
+                                'payment_method_details': {'type': invoice.payment_settings.payment_method_types[0] if invoice.payment_settings.payment_method_types else 'unknown'}
+                            }
+                        )
+                        print(f"Invoice payment succeeded for subscription {stripe_subscription_id}")
+                    else:
+                        print(f"Webhook Warning: UserSubscription not found for stripe_subscription_id {stripe_subscription_id} or customer {stripe_customer_id} during invoice.payment_succeeded.")
+
+
+                elif event_type == 'invoice.payment_failed':
+                    invoice = data_object
+                    stripe_subscription_id = invoice.get('subscription')
+                    user_sub = UserSubscription.objects.filter(stripe_subscription_id=stripe_subscription_id).first()
+                    if user_sub:
+                        user_sub.status = 'past_due' # Or based on Stripe's recommended status
+                        user_sub.save()
+                        # Create/Update PaymentTransaction to 'failed'
+                        PaymentTransaction.objects.update_or_create(
+                            stripe_charge_id=invoice.payment_intent or invoice.charge or f"failed_inv_{invoice.id}", # Ensure a unique ID
+                            stripe_invoice_id=invoice.id,
+                            defaults={
+                                'user':user_sub.user,
+                                'user_subscription': user_sub,
+                                'amount': Decimal(invoice.amount_due) / 100,
+                                'currency': invoice.currency.upper(),
+                                'status': 'failed',
+                                'description': f"Invoice payment failed: {invoice.number or invoice.id}. Reason: {invoice.last_finalization_error.message if invoice.last_finalization_error else 'Unknown'}",
+                            }
+                        )
+                        print(f"Invoice payment failed for subscription {stripe_subscription_id}")
+                        # TODO: Notify user about payment failure
+
+                elif event_type == 'customer.subscription.updated':
+                    stripe_sub = data_object
+                    user_sub = UserSubscription.objects.filter(stripe_subscription_id=stripe_sub.id).first()
+                    if user_sub:
+                        user_sub.status = stripe_sub.status
+                        user_sub.current_period_start = timezone.datetime.fromtimestamp(stripe_sub.current_period_start, tz=timezone.utc)
+                        user_sub.current_period_end = timezone.datetime.fromtimestamp(stripe_sub.current_period_end, tz=timezone.utc)
+                        user_sub.cancel_at_period_end = stripe_sub.cancel_at_period_end
+                        if stripe_sub.canceled_at:
+                            user_sub.cancelled_at = timezone.datetime.fromtimestamp(stripe_sub.canceled_at, tz=timezone.utc)
+                            user_sub.status = 'cancelled' # Ensure final status
+                        
+                        # Update plan if changed (e.g. upgrade/downgrade)
+                        new_stripe_price_id = stripe_sub.items.data[0].price.id
+                        if user_sub.plan.stripe_price_id != new_stripe_price_id:
+                            new_plan = SubscriptionPlan.objects.filter(stripe_price_id=new_stripe_price_id).first()
+                            if new_plan:
+                                user_sub.plan = new_plan
+                            else:
+                                print(f"Webhook Warning: New plan with Stripe Price ID {new_stripe_price_id} not found in DB.")
+                        
+                        user_sub.save()
+                        print(f"Subscription {stripe_sub.id} updated. Status: {user_sub.status}")
+
+                elif event_type == 'customer.subscription.deleted': # Or .canceled
+                    stripe_sub = data_object
+                    user_sub = UserSubscription.objects.filter(stripe_subscription_id=stripe_sub.id).first()
+                    if user_sub:
+                        user_sub.status = 'cancelled'
+                        user_sub.cancelled_at = timezone.datetime.fromtimestamp(stripe_sub.canceled_at, tz=timezone.utc) if stripe_sub.canceled_at else timezone.now()
+                        user_sub.current_period_end = user_sub.cancelled_at # Ensure period end reflects cancellation
+                        user_sub.save()
+                        print(f"Subscription {stripe_sub.id} deleted/cancelled.")
+                
+                elif event_type == 'customer.subscription.trial_will_end':
+                    # Send reminder to user
+                    print(f"Subscription trial ending soon for {data_object.id}")
+                    pass
+
+                # Add more event handlers as needed:
+                # - payment_intent.succeeded, payment_intent.payment_failed
+                # - customer.updated (e.g., default payment method changed)
+                # - etc.
+
+                else:
+                    print(f'Unhandled event type {event_type}')
+
+        except User.DoesNotExist: # Or UserProfile.DoesNotExist
+            print(f"Webhook Error: User or UserProfile not found for Stripe Customer ID {data_object.get('customer')}")
+            # It's important not to crash the webhook handler, so log and return 200 if possible,
+            # or 400 if it's a clear data issue that Stripe shouldn't retry.
+            return Response({'status': 'error', 'message': 'User mapping issue'}, status=status.HTTP_400_BAD_REQUEST)
+        except UserSubscription.DoesNotExist:
+            print(f"Webhook Error: UserSubscription not found for Stripe Subscription ID {data_object.get('id') or data_object.get('subscription')}")
+            return Response({'status': 'error', 'message': 'Subscription mapping issue'}, status=status.HTTP_400_BAD_REQUEST)
+        except SubscriptionPlan.DoesNotExist:
+            print(f"Webhook Error: SubscriptionPlan not found for Stripe Price ID {data_object.get('items', {}).get('data', [{}])[0].get('price', {}).get('id')}")
+            return Response({'status': 'error', 'message': 'Plan mapping issue'}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            # Log the exception for debugging
+            print(f"Webhook processing error: {str(e)}")
+            # Return 500 to signal Stripe to retry (for transient errors)
+            # or 400 if it's a permanent issue with the event data.
+            return Response({'error': 'Webhook processing error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
         return Response({'status': 'success'}, status=status.HTTP_200_OK)
