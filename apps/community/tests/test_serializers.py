@@ -1,262 +1,320 @@
 from django.test import TestCase
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from django.utils.text import slugify
-from rest_framework.test import APIRequestFactory # For providing request context
+from django.contrib.contenttypes.models import ContentType
+from uuid import uuid4
 
-from ..models import (
-    CommunityCategory, CommunityGroup, GroupMembership,
-    CommunityPost, PostComment, PostReaction
+from rest_framework.test import APIRequestFactory # For providing request context
+from rest_framework.exceptions import ValidationError
+
+from apps.community.models import (
+    Forum, Thread, Post, Comment, Like, Report
 )
-from ..serializers import (
-    CommunityCategorySerializer, CommunityGroupSerializer, GroupMembershipSerializer,
-    CommunityPostSerializer, PostCommentSerializer, PostReactionSerializer,
-    BasicUserSerializerForCommunity, BasicProjectTagSerializer # Import basic serializers used
+from apps.community.serializers import (
+    ForumListSerializer, ForumDetailSerializer,
+    ThreadListSerializer, ThreadDetailSerializer,
+    PostSerializer, CommentSerializer,
+    LikeSerializer, ReportSerializer,
+    SimpleUserSerializer # Assuming this is defined in community.serializers or imported
 )
-from apps.projects.models import ProjectTag # Assuming shared tag model
 
 User = get_user_model()
 
-class CommunityCategorySerializerTests(TestCase):
-    def test_category_serializer_valid_data(self):
-        category_data = {"name": "Introductions", "description": "Say hello!"}
-        # posts_count is read-only and annotated by view, not part of input data
-        serializer = CommunityCategorySerializer(data=category_data)
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-        category = serializer.save()
-        self.assertEqual(category.name, category_data["name"])
-
-    def test_category_serializer_output_data(self):
-        category = CommunityCategory.objects.create(name="Support", display_order=1)
-        # Simulate annotation from viewset
-        setattr(category, 'posts_count', 5) 
-        serializer = CommunityCategorySerializer(category)
-        data = serializer.data
-        self.assertEqual(data['name'], "Support")
-        self.assertEqual(data['display_order'], 1)
-        self.assertEqual(data['posts_count'], 5)
-        self.assertIn('slug', data)
-
-
-class CommunityGroupSerializerTests(TestCase):
-    def setUp(self):
-        self.creator = User.objects.create_user(email="groupcreator@example.com", password="password", full_name="Group Creator")
-        self.member_user = User.objects.create_user(email="groupmember@example.com", password="password", full_name="Group Member")
-        self.group = CommunityGroup.objects.create(name="Study Buddies", creator=self.creator, description="Let's study together")
-        
-        self.factory = APIRequestFactory()
-        self.request_member = self.factory.get('/')
-        self.request_member.user = self.member_user
-        
-        self.request_non_member = self.factory.get('/')
-        self.request_non_member.user = User.objects.create_user(email="non@ex.com", password="p")
-
-
-    def test_group_serializer_output_data(self):
-        """Test CommunityGroupSerializer output."""
-        # Simulate annotations from view
-        setattr(self.group, 'members_annotated_count', 0) # Initially no members except creator via GroupMembership model
-        setattr(self.group, 'is_member_annotated', False)
-
-        serializer = CommunityGroupSerializer(self.group, context={'request': self.request_non_member})
-        data = serializer.data
-        self.assertEqual(data['name'], self.group.name)
-        self.assertEqual(data['creator']['full_name'], self.creator.full_name)
-        self.assertEqual(data['members_count'], 0) # Relies on annotation or SerializerMethodField
-        self.assertFalse(data['is_member'])
-
-    def test_group_serializer_is_member_true(self):
-        """Test is_member is true when user is a member."""
-        GroupMembership.objects.create(user=self.member_user, group=self.group, role='member')
-        # Simulate annotations
-        setattr(self.group, 'members_annotated_count', 1)
-        setattr(self.group, 'is_member_annotated', True)
-        
-        serializer = CommunityGroupSerializer(self.group, context={'request': self.request_member})
-        data = serializer.data
-        self.assertTrue(data['is_member'])
-        self.assertEqual(data['members_count'], 1)
-
-
-class GroupMembershipSerializerTests(TestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(email="membershipuser@example.com", password="password", full_name="Membership User")
-        self.group = CommunityGroup.objects.create(name="Role Group", creator=self.user, description="d")
-        self.membership = GroupMembership.objects.create(user=self.user, group=self.group, role='admin')
-
-    def test_group_membership_serializer_output(self):
-        serializer = GroupMembershipSerializer(self.membership)
-        data = serializer.data
-        self.assertEqual(data['user']['full_name'], self.user.full_name)
-        self.assertEqual(data['group'], self.group.id) # PKRelatedField would show ID, if nested GroupSerializer then full object
-        self.assertEqual(data['role'], 'admin')
-        self.assertEqual(data['role_display'], 'Admin') # Check display value
-
-
-class CommunityPostSerializerTests(TestCase):
-    def setUp(self):
-        self.author = User.objects.create_user(email="postauthor_s@example.com", password="password", full_name="Post Author S")
-        self.category = CommunityCategory.objects.create(name="Discussions")
-        self.tag_general = ProjectTag.objects.create(name="General")
-        self.post = CommunityPost.objects.create(
-            author=self.author, title="First Post", content_html="<p>Hello world</p>", category=self.category
+# Test Data Setup Mixin (adapted for serializer tests)
+class CommunitySerializerTestDataMixin:
+    @classmethod
+    def setUpTestData(cls):
+        cls.user1 = User.objects.create_user(
+            username='comser_user1', email='comser_user1@example.com',
+            password='password123', full_name='ComSer User One'
         )
-        self.post.tags.add(self.tag_general)
+        cls.user2 = User.objects.create_user(
+            username='comser_user2', email='comser_user2@example.com',
+            password='password123', full_name='ComSer User Two'
+        )
+        cls.moderator_user = User.objects.create_user(
+            username='comser_moderator', email='comser_moderator@example.com',
+            password='password123', full_name='ComSer Moderator', is_staff=True
+        )
 
-        self.factory = APIRequestFactory()
-        self.request = self.factory.get('/')
-        self.request.user = self.author # For user_reaction_type context
+        cls.forum_general = Forum.objects.create(
+            name='General Serializer Forum', slug='general-serializer-forum',
+            description='For testing serializers.', display_order=0
+        )
+        # Thread signal updates forum_general.thread_count and post_count
+        cls.thread1 = Thread.objects.create(
+            forum=cls.forum_general, author=cls.user1,
+            title='Thread for Serializer Test', slug='thread-serializer-test',
+            content='Initial content for thread serializer test.'
+        )
+        # Post signal updates thread1.reply_count, last_activity_at and forum_general.post_count
+        cls.post1_thread1 = Post.objects.create(
+            thread=cls.thread1, author=cls.user2,
+            content='A reply to test post serializer.'
+        )
+        cls.comment1_post1 = Comment.objects.create(
+            post=cls.post1_thread1, author=cls.user1,
+            content='A comment on the post.'
+        )
 
-    def test_community_post_serializer_output(self):
-        """Test CommunityPostSerializer basic output."""
-        # Simulate annotated reaction for efficiency
-        # setattr(self.post, 'current_user_reaction_on_post_annotated', None) # No reaction initially
+        # For providing request context to serializers
+        cls.factory = APIRequestFactory()
+
+        # Mock requests with different users
+        cls.request_user1 = cls.factory.get('/fake-community-endpoint')
+        cls.request_user1.user = cls.user1
+        cls.request_user1.method = 'GET' # Default, can be changed in tests
+
+        cls.request_user2 = cls.factory.get('/fake-community-endpoint')
+        cls.request_user2.user = cls.user2
+        cls.request_user2.method = 'GET'
+
+        cls.request_moderator = cls.factory.get('/fake-community-endpoint')
+        cls.request_moderator.user = cls.moderator_user
+        cls.request_moderator.method = 'GET'
         
-        # Create context dictionary
-        context_data = {'request': self.request}
-        # If using the 'user_reactions_map' optimization from view for list context:
-        # context_data['user_reactions_map'] = {self.post.id: None}
+        cls.request_anonymous = cls.factory.get('/fake-community-endpoint')
+        # Simulate anonymous user by not setting request.user or using Django's AnonymousUser
+        from django.contrib.auth.models import AnonymousUser
+        cls.request_anonymous.user = AnonymousUser()
+        cls.request_anonymous.method = 'GET'
 
 
-        serializer = CommunityPostSerializer(self.post, context=context_data)
+class ForumSerializersTests(CommunitySerializerTestDataMixin, TestCase):
+    def test_forum_list_serializer_output(self):
+        self.forum_general.refresh_from_db() # Ensure counts are updated by signals
+        serializer = ForumListSerializer(instance=self.forum_general)
         data = serializer.data
-        self.assertEqual(data['title'], self.post.title)
-        self.assertEqual(data['author']['full_name'], self.author.full_name)
-        self.assertEqual(data['category']['name'], self.category.name)
-        self.assertEqual(len(data['tags']), 1)
-        self.assertEqual(data['tags'][0]['name'], self.tag_general.name)
-        self.assertEqual(data['comment_count'], 0) # Denormalized field
-        self.assertEqual(data['reaction_count'], 0) # Denormalized field
-        self.assertIsNone(data['user_reaction_type']) # No reaction from this user yet
+        self.assertEqual(data['name'], self.forum_general.name)
+        self.assertEqual(data['slug'], self.forum_general.slug)
+        self.assertEqual(data['thread_count'], 1) # thread1
+        self.assertEqual(data['post_count'], 2) # thread1 content + post1_thread1
 
-    def test_community_post_serializer_with_user_reaction(self):
-        """Test user_reaction_type is serialized correctly."""
-        PostReaction.objects.create(user=self.author, post=self.post, reaction_type='like')
-        
-        # Simulate annotation (if view provides it this way)
-        # setattr(self.post, 'current_user_reaction_on_post_annotated', 'like')
-        
-        # Create context dictionary
-        context_data = {'request': self.request}
-        # If using the 'user_reactions_map' optimization from view:
-        # context_data['user_reactions_map'] = {self.post.id: 'like'}
-
-
-        serializer = CommunityPostSerializer(self.post, context=context_data)
+    def test_forum_detail_serializer_output(self):
+        serializer = ForumDetailSerializer(instance=self.forum_general)
         data = serializer.data
-        self.assertEqual(data['user_reaction_type'], 'like')
+        self.assertEqual(data['name'], self.forum_general.name)
+        self.assertIn('created_at', data)
 
-    def test_community_post_serializer_create_valid(self):
-        post_data = {
-            "title": "New Post Title",
-            "content_html": "<p>Some exciting content!</p>",
-            "category_id": self.category.id, # Pass ID for writable related field
-            "tag_ids": [self.tag_general.id]  # Pass list of IDs for M2M
+    def test_forum_detail_serializer_create_valid(self):
+        data = {'name': 'New Tech Forum', 'slug': 'new-tech-forum', 'description': 'Discuss new tech.'}
+        serializer = ForumDetailSerializer(data=data, context={'request': self.request_moderator}) # Admin context
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        forum = serializer.save()
+        self.assertEqual(forum.name, 'New Tech Forum')
+
+class ThreadSerializersTests(CommunitySerializerTestDataMixin, TestCase):
+    def test_thread_list_serializer_output(self):
+        # User1 likes their own thread
+        Like.objects.create(user=self.user1, content_object=self.thread1)
+        self.thread1.refresh_from_db() # For like_count
+
+        serializer = ThreadListSerializer(instance=self.thread1, context={'request': self.request_user1})
+        data = serializer.data
+        self.assertEqual(data['title'], self.thread1.title)
+        self.assertEqual(data['author']['username'], self.user1.username)
+        self.assertEqual(data['forum_name'], self.forum_general.name)
+        self.assertEqual(data['reply_count'], 1) # post1_thread1
+        self.assertEqual(data['like_count'], 1)
+        self.assertTrue(data['is_liked_by_user']) # user1 liked it
+        self.assertTrue(data['user_can_edit']) # user1 is author
+
+    def test_thread_detail_serializer_read(self):
+        serializer = ThreadDetailSerializer(instance=self.thread1, context={'request': self.request_user2})
+        data = serializer.data
+        self.assertEqual(data['title'], self.thread1.title)
+        self.assertEqual(data['content'], self.thread1.content)
+        self.assertFalse(data['is_liked_by_user']) # user2 has not liked it
+        self.assertFalse(data['user_can_edit']) # user2 is not author or staff
+        self.assertTrue(data['user_can_reply']) # Thread is open
+
+    def test_thread_detail_serializer_create_valid(self):
+        data = {
+            "forum_id": self.forum_general.id, # Assuming direct forum_id for simplicity here
+            "title": "A Brand New Thread",
+            "content": "Content for the new thread.",
+            # Slug will be auto-generated
         }
-        # Serializer needs author from context (typically view's perform_create)
-        serializer = CommunityPostSerializer(data=post_data, context={'request': self.request})
+        # Create a POST request mock
+        request_post_user2 = self.factory.post('/fake-community-endpoint')
+        request_post_user2.user = self.user2
+
+        serializer = ThreadDetailSerializer(data=data, context={'request': request_post_user2})
         self.assertTrue(serializer.is_valid(), serializer.errors)
-        # To test save, we need to simulate how view sets the author:
-        # saved_post = serializer.save(author=self.author)
-        # self.assertEqual(saved_post.title, post_data['title'])
-        # self.assertIn(self.tag_general, saved_post.tags.all())
-
-    def test_community_post_serializer_content_required(self):
-        post_data = {"title": "Missing Content Post"}
-        serializer = CommunityPostSerializer(data=post_data, context={'request': self.request})
-        self.assertFalse(serializer.is_valid())
-        self.assertIn('content_html', serializer.errors)
-
-
-class PostCommentSerializerTests(TestCase):
-    def setUp(self):
-        self.comment_author = User.objects.create_user(email="commenter_s@example.com", password="password", full_name="Commenter S")
-        post_author = User.objects.create_user(email="p_author_s@example.com", password="password")
-        self.post = CommunityPost.objects.create(author=post_author, title="Post with Comments", content_html="...")
-        self.comment1 = PostComment.objects.create(post=self.post, author=self.comment_author, content_html="First!")
+        thread = serializer.save(author=self.user2, forum=self.forum_general) # Author & forum set in view normally
         
-        self.factory = APIRequestFactory()
-        self.request = self.factory.get('/')
-        self.request.user = self.comment_author
+        self.assertEqual(thread.title, "A Brand New Thread")
+        self.assertEqual(thread.author, self.user2)
+        self.assertEqual(thread.forum, self.forum_general)
+        self.assertEqual(thread.slug, slugify("A Brand New Thread"))
 
-    def test_post_comment_serializer_output(self):
-        context_data = {'request': self.request}
-        serializer = PostCommentSerializer(self.comment1, context=context_data)
+    def test_thread_detail_serializer_update_by_author(self):
+        data = {"title": "Updated Title by Author", "content": "Updated content."}
+        serializer = ThreadDetailSerializer(instance=self.thread1, data=data, partial=True, context={'request': self.request_user1})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        thread = serializer.save()
+        self.assertEqual(thread.title, "Updated Title by Author")
+
+
+class PostSerializerTests(CommunitySerializerTestDataMixin, TestCase):
+    def test_post_serializer_output(self):
+        Like.objects.create(user=self.user1, content_object=self.post1_thread1)
+        self.post1_thread1.refresh_from_db()
+
+        serializer = PostSerializer(instance=self.post1_thread1, context={'request': self.request_user1})
         data = serializer.data
-        self.assertEqual(data['content_html'], self.comment1.content_html)
-        self.assertEqual(data['author']['full_name'], self.comment_author.full_name)
-        self.assertEqual(data['reaction_count'], 0)
-        self.assertEqual(data['replies_count'], 0)
-        self.assertIsNone(data['user_reaction_type'])
+        self.assertEqual(data['content'], self.post1_thread1.content)
+        self.assertEqual(data['author']['username'], self.user2.username) # user2 is author of post1
+        self.assertEqual(data['thread_title'], self.thread1.title)
+        self.assertEqual(data['like_count'], 1)
+        self.assertTrue(data['is_liked_by_user']) # user1 liked user2's post
+        self.assertFalse(data['user_can_edit']) # user1 is not author of post1
 
-    def test_post_comment_serializer_with_user_reaction(self):
-        PostReaction.objects.create(user=self.comment_author, comment=self.comment1, reaction_type='heart')
+    def test_post_serializer_create_valid(self):
+        data = {
+            "thread_id": self.thread1.id,
+            "content": "User1 replying to thread1."
+        }
+        request_post_user1 = self.factory.post('/fake-community-endpoint')
+        request_post_user1.user = self.user1
+
+        serializer = PostSerializer(data=data, context={'request': request_post_user1})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        post = serializer.save(author=self.user1, thread=self.thread1) # Author & thread set in view
+        self.assertEqual(post.content, "User1 replying to thread1.")
+        self.assertEqual(post.author, self.user1)
+
+    def test_post_serializer_create_on_closed_thread_fails(self):
+        self.thread1.is_closed = True
+        self.thread1.save()
+        data = {"thread_id": self.thread1.id, "content": "Trying to post on closed."}
+        serializer = PostSerializer(data=data, context={'request': self.request_user1})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('thread_id', serializer.errors) # Validation is on thread_id
+        self.assertIn("Cannot post to a closed thread.", str(serializer.errors['thread_id']))
+
+
+class CommentSerializerTests(CommunitySerializerTestDataMixin, TestCase):
+    def test_comment_serializer_output(self):
+        serializer = CommentSerializer(instance=self.comment1_post1, context={'request': self.request_user2})
+        data = serializer.data
+        self.assertEqual(data['content'], self.comment1_post1.content)
+        self.assertEqual(data['author']['username'], self.user1.username) # user1 authored comment1
+        self.assertFalse(data['is_liked_by_user']) # user2 viewing user1's comment
+        self.assertFalse(data['user_can_edit']) # user2 not author
+
+    def test_comment_serializer_create_valid(self):
+        data = {
+            "post_id": self.post1_thread1.id,
+            "content": "User2 commenting on user2's post (self.post1_thread1)."
+        }
+        request_post_user2 = self.factory.post('/fake-community-endpoint')
+        request_post_user2.user = self.user2
+
+        serializer = CommentSerializer(data=data, context={'request': request_post_user2})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        comment = serializer.save(author=self.user2, post=self.post1_thread1)
+        self.assertEqual(comment.author, self.user2)
+
+
+class LikeSerializerTests(CommunitySerializerTestDataMixin, TestCase):
+    def test_like_create_valid_thread(self):
+        data = {
+            "content_type_model": "thread",
+            "object_id": str(self.thread1.id)
+        }
+        # User2 likes thread1
+        request_post_user2 = self.factory.post('/fake-community-endpoint')
+        request_post_user2.user = self.user2
+        request_post_user2.method = 'POST' # Important for serializer's duplicate check
+
+        serializer = LikeSerializer(data=data, context={'request': request_post_user2})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        like = serializer.save() # User is set from context in create()
+        self.assertEqual(like.user, self.user2)
+        self.assertEqual(like.liked_object, self.thread1)
+        self.thread1.refresh_from_db()
+        self.assertEqual(self.thread1.like_count, 1)
+
+    def test_like_create_duplicate_fails(self):
+        Like.objects.create(user=self.user2, content_object=self.thread1) # User2 already liked
+        data = {"content_type_model": "thread", "object_id": str(self.thread1.id)}
+        request_post_user2 = self.factory.post('/fake-community-endpoint')
+        request_post_user2.user = self.user2
+        request_post_user2.method = 'POST'
+
+        serializer = LikeSerializer(data=data, context={'request': request_post_user2})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('non_field_errors', serializer.errors) # Or specific error key
+        self.assertIn("You have already liked this item.", str(serializer.errors['non_field_errors']))
+
+    def test_like_create_invalid_content_type_model(self):
+        data = {"content_type_model": "invalidmodel", "object_id": str(self.thread1.id)}
+        serializer = LikeSerializer(data=data, context={'request': self.request_user1})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('content_type_model', serializer.errors)
+
+    def test_like_create_non_existent_object_id(self):
+        data = {"content_type_model": "thread", "object_id": str(uuid4())} # Random UUID
+        serializer = LikeSerializer(data=data, context={'request': self.request_user1})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('object_id', serializer.errors)
+
+
+class ReportSerializerTests(CommunitySerializerTestDataMixin, TestCase):
+    def test_report_create_valid(self):
+        data = {
+            "content_type_model": "post",
+            "object_id": str(self.post1_thread1.id),
+            "reason": "This post is offensive."
+        }
+        request_post_user1 = self.factory.post('/fake-community-endpoint')
+        request_post_user1.user = self.user1
+        request_post_user1.method = 'POST'
+
+        serializer = ReportSerializer(data=data, context={'request': request_post_user1})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        report = serializer.save() # Reporter set from context
+        self.assertEqual(report.reporter, self.user1)
+        self.assertEqual(report.reported_object, self.post1_thread1)
+        self.assertEqual(report.reason, "This post is offensive.")
+        self.assertEqual(report.status, 'pending')
+
+    def test_report_create_duplicate_pending_fails(self):
+        Report.objects.create(reporter=self.user1, content_object=self.post1_thread1, reason="Initial report", status='pending')
+        data = {"content_type_model": "post", "object_id": str(self.post1_thread1.id), "reason": "Reporting again."}
         
-        context_data = {'request': self.request}
-        # Simulate annotation/prefetch if view provides it this way
-        # setattr(self.comment1, 'current_user_reaction_on_comment_annotated', 'heart')
-        # context_data['user_reactions_map'] = {self.comment1.id: 'heart'}
+        request_post_user1 = self.factory.post('/fake-community-endpoint')
+        request_post_user1.user = self.user1
+        request_post_user1.method = 'POST'
 
+        serializer = ReportSerializer(data=data, context={'request': request_post_user1})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('non_field_errors', serializer.errors)
+        self.assertIn("You have already submitted a pending report for this item.", str(serializer.errors['non_field_errors']))
 
-        serializer = PostCommentSerializer(self.comment1, context=context_data)
+    def test_report_serialization_output_with_details(self):
+        report = Report.objects.create(reporter=self.user1, content_object=self.post1_thread1, reason="Test", status='resolved_action_taken', resolved_by=self.moderator_user)
+        serializer = ReportSerializer(instance=report, context={'request': self.request_moderator})
         data = serializer.data
-        self.assertEqual(data['user_reaction_type'], 'heart')
+        self.assertEqual(data['reporter']['username'], self.user1.username)
+        self.assertEqual(data['resolved_by']['username'], self.moderator_user.username)
+        self.assertEqual(data['status_display'], dict(REPORT_STATUS_CHOICES).get('resolved_action_taken'))
+        self.assertIsNotNone(data['reported_object_details'])
+        self.assertEqual(data['reported_object_details']['type'], 'post')
+        self.assertEqual(data['reported_object_details']['id'], str(self.post1_thread1.id))
 
-    def test_post_comment_create_valid(self):
-        comment_data = {"content_html": "A new insightful comment."}
-        # Post and author set by view context
-        serializer = PostCommentSerializer(data=comment_data, context={'request': self.request})
+    def test_report_update_by_admin(self):
+        report = Report.objects.create(reporter=self.user1, content_object=self.post1_thread1, reason="Test", status='pending')
+        data = {
+            "status": "resolved_no_action",
+            "moderator_notes": "Reviewed, no action needed."
+        }
+        serializer = ReportSerializer(instance=report, data=data, partial=True, context={'request': self.request_moderator})
         self.assertTrue(serializer.is_valid(), serializer.errors)
-        # saved_comment = serializer.save(author=self.comment_author, post=self.post)
-        # self.assertEqual(saved_comment.content_html, comment_data['content_html'])
+        updated_report = serializer.save() # resolved_by is set in view typically, or serializer update
+        self.assertEqual(updated_report.status, "resolved_no_action")
+        self.assertEqual(updated_report.moderator_notes, "Reviewed, no action needed.")
+        # self.assertEqual(updated_report.resolved_by, self.moderator_user) # If serializer's update sets it
 
-class PostReactionSerializerTests(TestCase):
-    def setUp(self):
-        self.reactor = User.objects.create_user(email="reactor_s@example.com", password="password", full_name="Reactor S")
-        post_author = User.objects.create_user(email="post_author_r@example.com", password="password")
-        self.post = CommunityPost.objects.create(author=post_author, title="Reactable Post", content_html="...")
-        self.comment = PostComment.objects.create(post=self.post, author=post_author, content_html="Reactable Comment")
-        
-        self.factory = APIRequestFactory()
-        self.request = self.factory.get('/') # For context
-        self.request.user = self.reactor
-
-    def test_post_reaction_serializer_create_for_post(self):
-        data = {"post": self.post.id, "reaction_type": "like"}
-        serializer = PostReactionSerializer(data=data, context={'request': self.request})
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-        # reaction = serializer.save(user=self.reactor) # User set by view
-        # self.assertEqual(reaction.post, self.post)
-        # self.assertEqual(reaction.reaction_type, 'like')
-
-    def test_post_reaction_serializer_create_for_comment(self):
-        data = {"comment": self.comment.id, "reaction_type": "heart"}
-        serializer = PostReactionSerializer(data=data, context={'request': self.request})
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-
-    def test_post_reaction_serializer_missing_target(self):
-        """Test fails if neither post nor comment is provided."""
-        data = {"reaction_type": "laugh"}
-        serializer = PostReactionSerializer(data=data, context={'request': self.request})
-        self.assertFalse(serializer.is_valid())
-        self.assertIn("non_field_errors", serializer.errors) # From validate method
-
-    def test_post_reaction_serializer_both_targets(self):
-        """Test fails if both post and comment are provided."""
-        data = {"post": self.post.id, "comment": self.comment.id, "reaction_type": "laugh"}
-        serializer = PostReactionSerializer(data=data, context={'request': self.request})
-        self.assertFalse(serializer.is_valid())
-        self.assertIn("non_field_errors", serializer.errors)
-
-    def test_post_reaction_serializer_invalid_reaction_type(self):
-        data = {"post": self.post.id, "reaction_type": "invalid_react"}
-        serializer = PostReactionSerializer(data=data, context={'request': self.request})
-        self.assertFalse(serializer.is_valid())
-        self.assertIn("reaction_type", serializer.errors)
-
-    def test_post_reaction_serializer_output(self):
-        reaction = PostReaction.objects.create(user=self.reactor, post=self.post, reaction_type='insightful')
-        serializer = PostReactionSerializer(reaction, context={'request': self.request})
-        data = serializer.data
-        self.assertEqual(data['reaction_type'], 'insightful')
-        self.assertEqual(data['reaction_type_display'], 'Insightful')
-        self.assertEqual(data['user']['full_name'], self.reactor.full_name)
