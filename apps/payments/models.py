@@ -1,263 +1,264 @@
+import uuid
 from django.db import models
 from django.conf import settings
 from django.utils.translation import gettext_lazy as _
-from django.utils import timezone # Ensure timezone is imported for UserSubscription save logic
-import uuid
-from django.utils.text import slugify
+from django.utils import timezone
 
+# Assuming your courses app has a Course model
+# from apps.courses.models import Course # Uncomment if direct linking to Course is needed for one-time purchases
+
+# Choices for Subscription Plan
+BILLING_CYCLE_CHOICES = [
+    ('monthly', _('Monthly')),
+    ('quarterly', _('Quarterly')),
+    ('annually', _('Annually')),
+    # ('one_time', _('One-Time Purchase')), # If you have one-time course purchases vs subscriptions
+]
+
+# Choices for Payment Status
+PAYMENT_STATUS_CHOICES = [
+    ('pending', _('Pending')),
+    ('succeeded', _('Succeeded')),
+    ('failed', _('Failed')),
+    ('refunded', _('Refunded')),
+    ('requires_action', _('Requires Action')), # For SCA
+]
+
+# Choices for Subscription Status
+SUBSCRIPTION_STATUS_CHOICES = [
+    ('active', _('Active')),
+    ('inactive', _('Inactive')), # Generic inactive state
+    ('pending_cancellation', _('Pending Cancellation')), # User requested cancellation, active until end of cycle
+    ('cancelled', _('Cancelled')), # Fully cancelled, no access
+    ('past_due', _('Past Due')), # Payment failed, grace period might apply
+    ('incomplete', _('Incomplete')), # Initial payment failed or requires action
+    ('trialing', _('Trialing')),
+]
 
 class SubscriptionPlan(models.Model):
-    PLAN_TIER_CHOICES = [
-        ('free', _('Free')),
-        ('basic', _('Basic')),
-        ('premium', _('Premium')),
-        ('enterprise', _('Enterprise')),
-    ]
-    BILLING_INTERVAL_CHOICES = [
-        ('month', _('Monthly')),
-        ('year', _('Annually')),
-        ('one_time', _('One-Time')),
-    ]
-
+    """
+    Defines different subscription plans available (e.g., Basic Monthly, Premium Annually).
+    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(_("Plan Name"), max_length=100, unique=True)
-    tier_level = models.CharField(
-        _("Plan Tier"),
-        max_length=20,
-        choices=PLAN_TIER_CHOICES,
-        default='basic'
-    )
-    slug = models.SlugField(_("Slug"), max_length=120, unique=True, blank=True, help_text=_("URL-friendly identifier, auto-generated if blank."))
-    description = models.TextField(_("Description"), blank=True, null=True)
-    price = models.DecimalField(_("Price"), max_digits=10, decimal_places=2)
-    currency = models.CharField(
-        _("Currency"),
-        max_length=3,
-        choices=settings.CURRENCY_CHOICES if hasattr(settings, 'CURRENCY_CHOICES') else [('USD', 'USD')],
-        default='USD'
-    )
-    billing_interval = models.CharField(
-        _("Billing Interval"),
-        max_length=10,
-        choices=BILLING_INTERVAL_CHOICES,
-        default='month'
-    )
+    name = models.CharField(max_length=100, unique=True, verbose_name=_('Plan Name'))
+    description = models.TextField(blank=True, null=True, verbose_name=_('Description'))
+    
+    # Stripe Price ID (price_xxxx) associated with this plan in Stripe
+    # This is crucial for creating subscriptions with Stripe.
     stripe_price_id = models.CharField(
-        _("Stripe Price ID"),
-        max_length=255,
-        blank=True, null=True,
-        unique=True, # A Stripe Price ID should uniquely identify one of our plans
-        help_text=_("Stripe API Price ID (e.g., price_xxxxxxxxxxxxxx). Must be unique.")
+        max_length=100,
+        unique=True, # Each plan in your system should map to one Stripe Price ID
+        verbose_name=_('Stripe Price ID'),
+        help_text=_("The Price ID from Stripe (e.g., price_xxxxxxxxxxxxxx).")
     )
-    features = models.JSONField(
-        _("Features"),
-        default=list, blank=True,
-        help_text=_("List of features included in this plan.")
-    )
-    is_active = models.BooleanField(
-        _("Active"), default=True,
-        help_text=_("Whether this plan is currently available for new subscriptions.")
-    )
-    display_order = models.PositiveIntegerField(_("Display Order"), default=0, help_text=_("Order on pricing page."))
+    # Stripe Product ID (prod_xxxx) can also be stored if you manage products separately in Stripe.
+    # stripe_product_id = models.CharField(max_length=100, blank=True, null=True, verbose_name=_('Stripe Product ID'))
 
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+
+    price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name=_('Price per Cycle'))
+    currency = models.CharField(
+        max_length=3,
+        default='USD',
+        choices=settings.CURRENCY_CHOICES, # Ensure CURRENCY_CHOICES is in settings.py
+        verbose_name=_('Currency')
+    )
+    billing_cycle = models.CharField(
+        max_length=20,
+        choices=BILLING_CYCLE_CHOICES,
+        default='monthly',
+        verbose_name=_('Billing Cycle')
+    )
+    
+    # Features or limits associated with this plan (e.g., number of courses, access level)
+    # This could be a JSONField or related models depending on complexity.
+    features = models.JSONField(default=dict, blank=True, null=True, verbose_name=_('Plan Features'), help_text=_("e.g., {'max_courses': 10, 'support_level': 'basic'}"))
+
+    is_active = models.BooleanField(default=True, verbose_name=_('Is Active'), help_text=_("Is this plan currently available for new subscriptions?"))
+    display_order = models.PositiveIntegerField(default=0, verbose_name=_('Display Order'), help_text=_("Order in which to display plans to users."))
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_('Created At'))
+    updated_at = models.DateTimeField(auto_now=True, verbose_name=_('Updated At'))
 
     class Meta:
-        verbose_name = _("Subscription Plan")
-        verbose_name_plural = _("Subscription Plans")
+        verbose_name = _('Subscription Plan')
+        verbose_name_plural = _('Subscription Plans')
         ordering = ['display_order', 'price']
 
-    def save(self, *args, **kwargs):
-        if not self.slug:
-            self.slug = slugify(f"{self.name}-{self.billing_interval}")
-            # Ensure slug uniqueness
-            original_slug = self.slug
-            counter = 1
-            while SubscriptionPlan.objects.filter(slug=self.slug).exclude(pk=self.pk).exists():
-                self.slug = f"{original_slug}-{counter}"
-                counter += 1
-        super().save(*args, **kwargs)
-
     def __str__(self):
-        return f"{self.name} ({self.get_billing_interval_display()} - {self.price} {self.currency})"
+        return f"{self.name} ({self.price} {self.currency}/{self.billing_cycle})"
+
 
 class UserSubscription(models.Model):
-    STATUS_CHOICES = [
-        ('active', _('Active')),
-        ('trialing', _('Trialing')),
-        ('past_due', _('Past Due')), # Payment failed for renewal
-        ('canceled', _('Canceled')), # User initiated cancellation, or admin after grace period
-        ('unpaid', _('Unpaid')), # Stripe's state for subscriptions that are failing payment.
-        ('incomplete', _('Incomplete')), # Checkout started but not completed
-        ('incomplete_expired', _('Incomplete Expired')), # Checkout session expired
-        ('ended', _('Ended')), # Subscription completed its lifecycle without renewal (e.g., fixed term non-renewing)
-    ]
-
+    """
+    Tracks a user's subscription to a specific plan.
+    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.OneToOneField(
+    user = models.OneToOneField( # Typically, a user has one active subscription at a time.
+                                # If multiple subscriptions are allowed, change to ForeignKey.
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name='subscription'
+        related_name='subscription',
+        verbose_name=_('User')
     )
-    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True, related_name='user_subscriptions')
+    plan = models.ForeignKey(
+        SubscriptionPlan,
+        on_delete=models.SET_NULL, # Don't delete subscription if plan is deleted, just mark as inactive or handle
+        null=True, # Plan might be deleted or changed
+        related_name='user_subscriptions',
+        verbose_name=_('Subscription Plan')
+    )
     
+    # Stripe Subscription ID (sub_xxxx)
     stripe_subscription_id = models.CharField(
-        _("Stripe Subscription ID"),
-        max_length=255,
-        unique=True, null=True, blank=True # Unique, but can be null before Stripe sub is created
+        max_length=100,
+        unique=True, # Each active subscription in your system maps to one Stripe Subscription
+        verbose_name=_('Stripe Subscription ID'),
+        help_text=_("The Subscription ID from Stripe (e.g., sub_xxxxxxxxxxxxxx).")
     )
-    # We decided to store stripe_customer_id on the User model.
-    # It can be useful to also have it here for quick reference with the subscription if needed.
-    stripe_customer_id = models.CharField( 
-        _("Stripe Customer ID (Reference)"), # From user.stripe_customer_id
-        max_length=255,
-        null=True, blank=True,
-        help_text="Copied from User model for reference at the time of subscription event."
+    # Stripe Customer ID (cus_xxxx) - useful to store this per user or per subscription
+    stripe_customer_id = models.CharField(
+        max_length=100,
+        verbose_name=_('Stripe Customer ID'),
+        help_text=_("The Customer ID from Stripe (e.g., cus_xxxxxxxxxxxxxx). Often stored on UserProfile too.")
     )
-    
+
     status = models.CharField(
-        _("Status (from Stripe)"), # Indicate this is Stripe's status
         max_length=25,
-        choices=STATUS_CHOICES,
-        default='incomplete' # Default to incomplete before Stripe confirmation
+        choices=SUBSCRIPTION_STATUS_CHOICES,
+        default='inactive',
+        verbose_name=_('Subscription Status')
     )
     
-    start_date = models.DateTimeField(_("Start Date"), null=True, blank=True)
-    current_period_start = models.DateTimeField(_("Current Period Start"), null=True, blank=True)
-    current_period_end = models.DateTimeField(_("Current Period End"), null=True, blank=True)
-    cancel_at_period_end = models.BooleanField(
-        _("Cancel at Period End (Stripe)"),
-        default=False,
-        help_text=_("If true, Stripe will cancel the subscription at the end of the current period.")
-    )
-    canceled_at = models.DateTimeField(_("Canceled At (Stripe)"), null=True, blank=True) # When Stripe confirms cancellation
-    ended_at = models.DateTimeField(_("Ended At (Stripe)"), null=True, blank=True) # If subscription truly ends (e.g., non-renewing fixed plan)
+    current_period_start = models.DateTimeField(null=True, blank=True, verbose_name=_('Current Period Start'))
+    current_period_end = models.DateTimeField(null=True, blank=True, verbose_name=_('Current Period End / Renewal Date'))
+    cancel_at_period_end = models.BooleanField(default=False, verbose_name=_('Cancel at Period End'))
+    
+    # If you offer trials
+    trial_start = models.DateTimeField(null=True, blank=True, verbose_name=_('Trial Start Date'))
+    trial_end = models.DateTimeField(null=True, blank=True, verbose_name=_('Trial End Date'))
 
-    trial_start_date = models.DateTimeField(_("Trial Start Date"), null=True, blank=True)
-    trial_end_date = models.DateTimeField(_("Trial End Date"), null=True, blank=True)
+    # Metadata from Stripe or your system
+    metadata = models.JSONField(default=dict, blank=True, null=True)
 
-    created_at = models.DateTimeField(auto_now_add=True) # Our record creation
-    updated_at = models.DateTimeField(auto_now=True) # Our record update
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_('Created At'))
+    updated_at = models.DateTimeField(auto_now=True, verbose_name=_('Updated At'))
+    cancelled_at = models.DateTimeField(null=True, blank=True, verbose_name=_('Cancelled At')) # When it was actually cancelled
 
     class Meta:
-        verbose_name = _("User Subscription")
-        verbose_name_plural = _("User Subscriptions")
+        verbose_name = _('User Subscription')
+        verbose_name_plural = _('User Subscriptions')
         ordering = ['-created_at']
 
     def __str__(self):
-        plan_name = self.plan.name if self.plan else "N/A"
-        return f"{self.user.email}'s Subscription to {plan_name} ({self.status})"
+        return f"{self.user.email}'s subscription to {self.plan.name if self.plan else 'N/A'}"
 
-    def is_currently_active(self): # More precise active check
-        """Checks if the subscription is effectively active for providing service."""
-        return self.status in ['active', 'trialing'] and \
-               (self.current_period_end is None or self.current_period_end >= timezone.now())
+    @property
+    def is_active(self):
+        """Checks if the subscription is currently active and within the period."""
+        return self.status == 'active' and (self.current_period_end is None or self.current_period_end >= timezone.now())
 
-    def save(self, *args, **kwargs):
-        # Ensure stripe_customer_id is synced from user if user is set
-        if self.user and self.user.stripe_customer_id and not self.stripe_customer_id:
-            self.stripe_customer_id = self.user.stripe_customer_id
-
-        super().save(*args, **kwargs) # Save first to get an ID if creating
-
-        # Update User model's denormalized premium status fields
-        # This should ideally be robust and handle cases where user object might not be fully loaded
-        try:
-            user_to_update = User.objects.get(pk=self.user_id) # Fresh instance
-            is_premium_now = self.is_currently_active()
-            
-            needs_user_save = False
-            if user_to_update.is_premium_subscriber != is_premium_now:
-                user_to_update.is_premium_subscriber = is_premium_now
-                needs_user_save = True
-            
-            new_plan_name = self.plan.name if self.plan and is_premium_now else None
-            if user_to_update.subscription_plan_name != new_plan_name:
-                user_to_update.subscription_plan_name = new_plan_name
-                needs_user_save = True
-
-            new_sub_end_date = self.current_period_end.date() if self.current_period_end and is_premium_now else None
-            if user_to_update.subscription_end_date != new_sub_end_date:
-                user_to_update.subscription_end_date = new_sub_end_date
-                needs_user_save = True
-
-            if needs_user_save:
-                user_to_update.save(update_fields=['is_premium_subscriber', 'subscription_plan_name', 'subscription_end_date'])
-        except User.DoesNotExist:
-            # Log this error, user associated with subscription doesn't exist
-            pass
+    @property
+    def is_trialing(self):
+        """Checks if the subscription is currently in a trial period."""
+        return self.status == 'trialing' and (self.trial_end is None or self.trial_end >= timezone.now())
 
 
-class Transaction(models.Model):
-    TRANSACTION_TYPE_CHOICES = [
-        ('subscription_signup', _('Subscription Signup')),
-        ('subscription_renewal', _('Subscription Renewal')),
-        ('one_time_purchase', _('One-Time Purchase')),
-        ('refund', _('Refund')),
-        ('credit_adjustment', _('Credit Adjustment')),
-        ('payment_intent', _('Payment Intent')), # General payment intent
-    ]
-    TRANSACTION_STATUS_CHOICES = [
-        ('pending', _('Pending')),
-        ('succeeded', _('Succeeded')),
-        ('failed', _('Failed')),
-        ('requires_action', _('Requires Action')),
-        ('requires_payment_method', _('Requires Payment Method')),
-        ('requires_confirmation', _('Requires Confirmation')),
-        ('processing', _('Processing')),
-        ('canceled', _('Canceled')), # For payment intents
-        ('refunded', _('Refunded')), # For charges
-        ('partially_refunded', _('Partially Refunded')), # For charges
-    ]
-
+class PaymentTransaction(models.Model):
+    """
+    Records individual payment transactions, often linked to Stripe Invoices or Charges.
+    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='transactions')
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL, # Keep transaction record even if user is deleted
+        null=True,
+        related_name='payment_transactions',
+        verbose_name=_('User')
+    )
+    # Link to subscription if this payment is for a subscription renewal
     user_subscription = models.ForeignKey(
         UserSubscription,
         on_delete=models.SET_NULL,
-        null=True, blank=True,
-        related_name='transactions'
+        null=True,
+        blank=True,
+        related_name='payment_transactions',
+        verbose_name=_('Associated Subscription')
     )
-    
-    # Stripe IDs: A transaction could be related to an Invoice, a PaymentIntent, or a Charge.
-    stripe_payment_intent_id = models.CharField(_("Stripe Payment Intent ID"), max_length=255, unique=True, null=True, blank=True)
-    stripe_charge_id = models.CharField(_("Stripe Charge ID"), max_length=255, unique=True, null=True, blank=True) # Often part of PaymentIntent
-    stripe_invoice_id = models.CharField(_("Stripe Invoice ID"), max_length=255, null=True, blank=True, db_index=True) # Invoices can have multiple payment attempts
+    # If you have one-time purchases for specific items (e.g., a single course)
+    # course_purchased = models.ForeignKey(
+    #     'courses.Course', # Use string reference to avoid circular import if Course model is in another app
+    #     on_delete=models.SET_NULL,
+    #     null=True, blank=True,
+    #     related_name='purchase_transactions'
+    # )
+    # item_description = models.CharField(max_length=255, blank=True, null=True, help_text="e.g., 'Subscription Renewal: Premium Plan' or 'Course: Intro to Python'")
 
-    transaction_type = models.CharField(
-        _("Transaction Type"),
-        max_length=30,
-        choices=TRANSACTION_TYPE_CHOICES,
-        default='payment_intent'
+
+    # Stripe Payment Intent ID (pi_xxxx) or Charge ID (ch_xxxx) or Invoice ID (in_xxxx)
+    stripe_charge_id = models.CharField(
+        max_length=100,
+        unique=True, # Stripe IDs are unique
+        verbose_name=_('Stripe Charge/PaymentIntent ID'),
+        help_text=_("The ID of the charge or payment intent from Stripe.")
+    )
+    stripe_invoice_id = models.CharField(
+        max_length=100,
+        null=True, blank=True, # Not all payments are tied to invoices (e.g., direct charges)
+        verbose_name=_('Stripe Invoice ID (if applicable)')
+    )
+
+    amount = models.DecimalField(max_digits=10, decimal_places=2, verbose_name=_('Amount Paid'))
+    currency = models.CharField(
+        max_length=3,
+        choices=settings.CURRENCY_CHOICES,
+        verbose_name=_('Currency')
     )
     status = models.CharField(
-        _("Status (from Stripe)"),
-        max_length=30, # Increased length for more Stripe statuses
-        choices=TRANSACTION_STATUS_CHOICES,
-        default='pending'
+        max_length=25,
+        choices=PAYMENT_STATUS_CHOICES,
+        default='pending',
+        verbose_name=_('Payment Status')
     )
-    amount = models.DecimalField(_("Amount"), max_digits=10, decimal_places=2) # Amount in major currency unit
-    currency = models.CharField(
-        _("Currency"),
-        max_length=3,
-        choices=settings.CURRENCY_CHOICES if hasattr(settings, 'CURRENCY_CHOICES') else [('USD', 'USD')],
-        default='USD'
-    )
+    payment_method_details = models.JSONField(default=dict, blank=True, null=True, verbose_name=_('Payment Method Details'), help_text=_("e.g., card brand, last4"))
     
-    payment_method_details = models.JSONField(_("Payment Method Details (from Stripe)"), null=True, blank=True)
-    description = models.TextField(_("Description (from Stripe or internal)"), blank=True, null=True)
+    # Description for the payment
+    description = models.CharField(max_length=255, blank=True, null=True, verbose_name=_('Description'))
     
-    error_message = models.TextField(_("Error Message (if failed, from Stripe)"), blank=True, null=True)
-    
-    created_at = models.DateTimeField(auto_now_add=True) # Our record creation time
-    processed_at = models.DateTimeField(_("Processed At (Stripe event time)"), null=True, blank=True) # When Stripe event occurred
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_('Transaction Initiated At')) # When record created in our system
+    paid_at = models.DateTimeField(null=True, blank=True, verbose_name=_('Paid At')) # When Stripe confirmed payment
+    updated_at = models.DateTimeField(auto_now=True, verbose_name=_('Last Updated At'))
+
+    # Full Stripe event object can be stored for auditing if needed
+    stripe_event_data = models.JSONField(default=dict, blank=True, null=True, verbose_name=_('Stripe Event Data Snapshot'))
+
 
     class Meta:
-        verbose_name = _("Transaction")
-        verbose_name_plural = _("Transactions")
-        ordering = ['-processed_at', '-created_at'] # Order by when Stripe processed it primarily
+        verbose_name = _('Payment Transaction')
+        verbose_name_plural = _('Payment Transactions')
+        ordering = ['-created_at']
 
     def __str__(self):
-        user_email = self.user.email if self.user else 'N/A'
-        return f"Transaction {self.id} for {user_email} - {self.amount} {self.currency} ({self.status})"
+        user_email = self.user.email if self.user else "N/A"
+        return f"Payment {self.id} by {user_email} - {self.amount} {self.currency} ({self.status})"
+
+# --- Optional: Discount/Coupon Models ---
+# class Coupon(models.Model):
+#     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+#     code = models.CharField(max_length=50, unique=True, verbose_name=_('Coupon Code'))
+#     # discount_type = models.CharField(max_length=10, choices=[('percentage', '%'), ('fixed', '$')])
+#     # discount_value = models.DecimalField(max_digits=10, decimal_places=2)
+#     # valid_from = models.DateTimeField()
+#     # valid_to = models.DateTimeField()
+#     # max_uses = models.PositiveIntegerField(null=True, blank=True)
+#     # times_used = models.PositiveIntegerField(default=0)
+#     # stripe_coupon_id = models.CharField(max_length=100, blank=True, null=True) # If managed in Stripe
+#     # applicable_plans = models.ManyToManyField(SubscriptionPlan, blank=True)
+#     pass
+
+# class UserCouponUsage(models.Model):
+#     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+#     coupon = models.ForeignKey(Coupon, on_delete=models.CASCADE)
+#     used_at = models.DateTimeField(auto_now_add=True)
+#     # payment_transaction = models.ForeignKey(PaymentTransaction, null=True, blank=True, on_delete=models.SET_NULL)
+#     pass
