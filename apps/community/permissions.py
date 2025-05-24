@@ -1,98 +1,154 @@
-from rest_framework import permissions
-from .models import CommunityGroup, GroupMembership, CommunityPost, PostComment # Ensure models are imported
+from rest_framework.permissions import BasePermission, SAFE_METHODS, IsAdminUser
+from .models import Forum, Thread, Post, Comment, Like, Report # Ensure correct import path
 
-class IsAuthorOrReadOnly(permissions.BasePermission):
+# IsAdminUser is a built-in DRF permission.
+# IsAuthenticated is also built-in.
+
+class IsAdminOrReadOnly(BasePermission):
     """
-    Custom permission to only allow authors of an object to edit it.
-    Read-only for everyone else.
+    Allows read-only access to any request, including unauthenticated users.
+    Allows write access (POST, PUT, PATCH, DELETE) only to admin users.
+    Useful for models like Forum where viewing is public but management is admin-only.
     """
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        return request.user and request.user.is_staff
+
+
+class IsAuthorOrReadOnly(BasePermission):
+    """
+    Object-level permission to only allow owners of an object to edit it.
+    Assumes the model instance has an `author` attribute.
+    Read-only access is granted to any request (authenticated or not),
+    unless combined with other permissions like IsAuthenticated.
+    """
+    message = "You do not have permission to edit or delete this content as you are not the author."
+
     def has_object_permission(self, request, view, obj):
-        if request.method in permissions.SAFE_METHODS:
+        # Read permissions are allowed to any request,
+        # so we'll always allow GET, HEAD or OPTIONS requests.
+        if request.method in SAFE_METHODS:
             return True
-        # Check if the obj has an 'author' attribute and if it matches the request user
-        return hasattr(obj, 'author') and obj.author == request.user
 
-class IsGroupAdminOrCreatorOrReadOnly(permissions.BasePermission):
-    """
-    Permission for CommunityGroup:
-    - Read-only for anyone (respecting group's is_private status, handled in view).
-    - Edit/Delete only by the group creator or a group admin.
-    """
-    def has_object_permission(self, request, view, obj: CommunityGroup):
-        if request.method in permissions.SAFE_METHODS:
-            # View-level logic in get_object or get_queryset should handle is_private visibility
-            return True
-        
-        if not request.user or not request.user.is_authenticated:
+        # Write permissions are only allowed to the author of the content or staff.
+        if not request.user.is_authenticated:
             return False
         
-        # Check if user is the creator
-        if obj.creator == request.user:
-            return True
-        
-        # Check if user is an admin of the group
-        try:
-            membership = GroupMembership.objects.get(user=request.user, group=obj)
-            return membership.role == 'admin'
-        except GroupMembership.DoesNotExist:
-            return False
-        return False
-
-class CanPostInGroup(permissions.BasePermission):
-    """
-    Permission to check if a user can create a post within a specific group.
-    Typically, must be a member. Admins/Moderators of the group can also post.
-    """
-    def has_object_permission(self, request, view, obj: CommunityGroup): # obj is the group
-        if not request.user or not request.user.is_authenticated:
-            return False
-        
-        # Staff can always post (e.g., for announcements)
+        # Staff/admins can edit/delete anything
         if request.user.is_staff:
             return True
             
-        try:
-            membership = GroupMembership.objects.get(user=request.user, group=obj)
-            # Allow members, admins, and moderators to post
-            return membership.role in ['member', 'admin', 'moderator']
-        except GroupMembership.DoesNotExist:
-            # If group is public and allows non-member posting (less common, configure if needed)
-            # if not obj.is_private and getattr(settings, 'ALLOW_NON_MEMBER_GROUP_POSTING', False):
-            #    return True
+        # Check if the object has an 'author' attribute and if it matches the request user.
+        # This works for Thread, Post, Comment if they have an 'author' field.
+        return hasattr(obj, 'author') and obj.author == request.user
+
+
+class CanCreateThreadOrPost(BasePermission):
+    """
+    Permission to check if a user can create a new thread in a forum
+    or a new post (reply) in a thread.
+    - User must be authenticated.
+    - For Threads: Forum must not be restricted in a way that prevents new threads (if such logic exists).
+    - For Posts: Thread must not be closed.
+    """
+    message = "You do not have permission to create content here at this time."
+
+    def has_permission(self, request, view):
+        if not request.user.is_authenticated:
+            self.message = "You must be logged in to create threads or posts."
+            return False
+        return True # Further checks might be needed based on view context
+
+    def has_object_permission(self, request, view, obj):
+        # This permission is more about "can this user post TO this object (Forum/Thread)?"
+        # It's often better handled at the view level before object creation,
+        # or by checking the parent object if this permission is applied to the parent.
+
+        if not request.user.is_authenticated:
+            self.message = "You must be logged in to create threads or posts."
             return False
 
+        if isinstance(obj, Forum): # Checking if user can create a Thread in this Forum
+            # Add any specific forum-level restrictions here if needed
+            # e.g., if forum.can_users_create_threads is False
+            return True # Assuming any authenticated user can create a thread in any forum for now
 
-class CanCommentOnPost(permissions.BasePermission):
-    """
-    Permission to check if a user can comment on a post.
-    Generally, if they can view the post and it's not closed.
-    """
-    def has_object_permission(self, request, view, obj: CommunityPost): # obj is the CommunityPost
-        if obj.is_closed:
-            return False # Cannot comment if post is closed
-        
-        # If post is in a private group, user must be a member of that group to comment
-        if obj.group and obj.group.is_private:
-            if not request.user or not request.user.is_authenticated:
+        if isinstance(obj, Thread): # Checking if user can create a Post (reply) in this Thread
+            if obj.is_closed:
+                self.message = "This thread is closed and no longer accepts replies."
                 return False
-            if not obj.group.members.filter(id=request.user.id).exists():
-                return False # Not a member of the private group containing the post
-                
-        return True # If public post, or public group post, or member of private group's post
-
-class CanManageGroupMembership(permissions.BasePermission):
-    """
-    Permission to manage group members (e.g., remove member, change role).
-    Only for group admins or the group creator.
-    """
-    def has_object_permission(self, request, view, obj: CommunityGroup): # obj is the group
-        if not request.user or not request.user.is_authenticated:
-            return False
-        if obj.creator == request.user:
+            if obj.is_hidden and not request.user.is_staff: # Only staff can reply to hidden threads
+                self.message = "This thread is currently hidden."
+                return False
             return True
-        try:
-            membership = GroupMembership.objects.get(user=request.user, group=obj)
-            return membership.role == 'admin'
-        except GroupMembership.DoesNotExist:
+        
+        return False # Should not apply to other object types directly for creation
+
+
+class IsModeratorOrAdmin(BasePermission):
+    """
+    Allows access only to users who are staff/admin or designated moderators.
+    For actions like pinning/closing threads, hiding content, managing reports.
+    (A more complex system might have a specific 'Moderator' role or group).
+    For now, we'll equate moderators with staff/admin users.
+    """
+    message = "You do not have moderator privileges to perform this action."
+
+    def has_permission(self, request, view):
+        return request.user and request.user.is_authenticated and request.user.is_staff
+
+    def has_object_permission(self, request, view, obj):
+        # Object-level check might not be strictly necessary if has_permission is sufficient,
+        # but can be used for finer-grained control if needed.
+        return request.user and request.user.is_authenticated and request.user.is_staff
+
+
+class CanInteractWithContent(BasePermission):
+    """
+    Permission for actions like Liking or Reporting content.
+    User must be authenticated.
+    The content itself (Thread, Post, Comment) should not be hidden from the user.
+    """
+    message = "You must be logged in to interact with content."
+
+    def has_permission(self, request, view):
+        return request.user and request.user.is_authenticated
+
+    def has_object_permission(self, request, view, obj):
+        # obj is the content being liked/reported (Thread, Post, Comment)
+        if not request.user.is_authenticated:
             return False
-        return False
+
+        if hasattr(obj, 'is_hidden') and obj.is_hidden:
+            # Allow staff to interact with hidden content, but not regular users
+            return request.user.is_staff
+        
+        # If it's a Post or Comment, also check if its parent Thread is hidden
+        parent_thread = None
+        if isinstance(obj, Post):
+            parent_thread = obj.thread
+        elif isinstance(obj, Comment):
+            parent_thread = obj.post.thread
+        
+        if parent_thread and parent_thread.is_hidden:
+            return request.user.is_staff
+            
+        return True
+
+
+class CanManageReport(BasePermission):
+    """
+    Permission for viewing details of a report or updating its status.
+    Restricted to staff/admin users.
+    """
+    message = "You do not have permission to manage reports."
+
+    def has_permission(self, request, view):
+        return request.user and request.user.is_authenticated and request.user.is_staff
+
+    def has_object_permission(self, request, view, obj):
+        # obj is a Report instance
+        return request.user and request.user.is_authenticated and request.user.is_staff
+
+
