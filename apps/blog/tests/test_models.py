@@ -1,213 +1,308 @@
 from django.test import TestCase
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from django.db import IntegrityError
 from django.utils.text import slugify
-from django.db.utils import IntegrityError
-from django.conf import settings # For settings.AUTH_USER_MODEL
+from django.contrib.contenttypes.models import ContentType # For GenericRelation tests
 
-from ..models import BlogCategory, BlogPost, BlogComment, Author, Tag # Assuming Tag is from projects
-from apps.projects.models import ProjectTag # Explicitly if Tag is ProjectTag
+from apps.blog.models import (
+    BlogCategory, BlogPostTag, BlogPost, BlogComment,
+    BLOG_POST_STATUS_CHOICES
+)
+# Assuming a Like model exists, e.g., in community, for GenericRelation testing
+# from apps.community.models import Like # Example if using community's Like model
 
 User = get_user_model()
 
-class BlogCategoryModelTests(TestCase):
-    def test_create_blog_category(self):
-        category = BlogCategory.objects.create(name="Tech Insights", display_order=1)
-        self.assertEqual(category.name, "Tech Insights")
-        self.assertEqual(category.slug, slugify("Tech Insights"))
-        self.assertEqual(str(category), "Tech Insights")
-
-    def test_blog_category_name_unique(self):
-        BlogCategory.objects.create(name="Tutorials")
-        with self.assertRaises(IntegrityError):
-            BlogCategory.objects.create(name="Tutorials")
-
-
-class AuthorModelTests(TestCase): # For the optional Author model
-    def setUp(self):
-        self.user = User.objects.create_user(
-            email="authoruser@example.com", password="password", full_name="Author User"
+class BlogModelTestDataMixin:
+    """
+    Mixin to provide common setup data for blog-related model tests.
+    """
+    @classmethod
+    def setUpTestData(cls):
+        # Create users
+        cls.author_user = User.objects.create_user(
+            username='blog_author1',
+            email='blogauthor1@example.com',
+            password='password123',
+            full_name='Blog Author One'
         )
-        # Simulate profile picture URL on User model or its profile
-        # If User model has profile_picture_url directly:
-        self.user.profile_picture_url = "http://example.com/user_avatar.png"
-        self.user.save()
-        # Or if User has a related profile:
-        # from apps.users.models import UserProfile # Assuming UserProfile model
-        # user_profile, _ = UserProfile.objects.get_or_create(user=self.user)
-        # user_profile.profile_picture_url = "http://example.com/user_avatar.png"
-        # user_profile.save()
-
-
-    def test_create_author_linked_to_user(self):
-        author_profile = Author.objects.create(
-            user=self.user,
-            display_name="Dr. Coder", # Override user's full_name
-            bio="Expert in all things code.",
-            avatar_url="http://example.com/author_override.png"
+        cls.commenter_user = User.objects.create_user(
+            username='blog_commenter1',
+            email='blogcommenter1@example.com',
+            password='password123',
+            full_name='Blog Commenter One'
         )
-        self.assertEqual(author_profile.user, self.user)
-        self.assertEqual(author_profile.display_name, "Dr. Coder")
-        self.assertEqual(str(author_profile), "Dr. Coder")
-        self.assertEqual(author_profile.get_display_name, "Dr. Coder")
-        self.assertEqual(author_profile.get_avatar_url, "http://example.com/author_override.png")
-
-    def test_create_author_guest(self): # Not linked to Uplas User
-        guest_author = Author.objects.create(
-            display_name="Guest Writer",
-            bio="Occasional contributor."
+        cls.admin_user = User.objects.create_superuser(
+            username='blog_admin',
+            email='blogadmin@example.com',
+            password='password123',
+            full_name='Blog Admin'
         )
-        self.assertIsNone(guest_author.user)
-        self.assertEqual(guest_author.display_name, "Guest Writer")
-        self.assertEqual(str(guest_author), "Guest Writer")
-        self.assertEqual(guest_author.get_display_name, "Guest Writer")
-        self.assertIsNone(guest_author.get_avatar_url) # No avatar set
 
-    def test_author_properties_fallback_to_user(self):
-        # Author profile linked to user, but display_name and avatar_url on Author model are blank
-        author_profile_minimal = Author.objects.create(user=self.user, display_name="") # Empty display name
-        self.assertEqual(author_profile_minimal.get_display_name, self.user.full_name) # Falls back to user's full_name
-        self.assertEqual(author_profile_minimal.get_avatar_url, self.user.profile_picture_url) # Falls back to user's avatar
+        # Create Blog Categories
+        cls.cat_tech = BlogCategory.objects.create(name='Technology', slug='technology')
+        cls.cat_tutorials = BlogCategory.objects.create(name='Tutorials', slug='tutorials')
 
+        # Create Blog Post Tags
+        cls.tag_python = BlogPostTag.objects.create(name='Python', slug='python')
+        cls.tag_django = BlogPostTag.objects.create(name='Django', slug='django')
+        cls.tag_webdev = BlogPostTag.objects.create(name='Web Development', slug='web-development')
 
-class BlogPostModelTests(TestCase):
-    def setUp(self):
-        self.uplas_user_author = User.objects.create_user(
-            email="blogauthor@example.com", password="password", full_name="Uplas Author"
-        )
-        self.guest_author_profile = Author.objects.create(display_name="Guest Blogger")
-        self.category = BlogCategory.objects.create(name="Announcements")
-        self.tag_news = Tag.objects.create(name="News") # Assuming Tag is ProjectTag
-
-    def test_create_blog_post_with_uplas_author(self):
-        post = BlogPost.objects.create(
-            title="Platform Update Vol. 1",
-            author=self.uplas_user_author,
-            content_html="<p>Exciting updates are here!</p>",
+        # Create Blog Posts
+        cls.post_published = BlogPost.objects.create(
+            author=cls.author_user,
+            category=cls.cat_tech,
+            title='Understanding Django Signals',
+            slug='understanding-django-signals', # Explicit slug for predictability
+            excerpt='A deep dive into how signals work in Django.',
+            content_markdown='## Introduction\nSignals are a powerful feature...',
             status='published',
-            category=self.category
+            # published_at will be set by save() method
         )
-        post.tags.add(self.tag_news)
+        cls.post_published.tags.add(cls.tag_django, cls.tag_python)
 
-        self.assertEqual(post.title, "Platform Update Vol. 1")
-        self.assertEqual(post.author, self.uplas_user_author)
-        self.assertIsNone(post.author_profile_override) # No override used
-        self.assertEqual(post.display_author_name, self.uplas_user_author.full_name)
-        self.assertEqual(post.status, 'published')
-        self.assertIsNotNone(post.publish_date)
-        self.assertTrue(post.slug.startswith(slugify("Platform Update Vol 1")))
-        self.assertIn(self.tag_news, post.tags.all())
-        self.assertTrue(post.excerpt.startswith(strip_tags(post.content_html)[:50])) # Check excerpt
-        self.assertEqual(post.meta_description, post.excerpt[:160]) # Check meta
-        self.assertEqual(str(post), "Platform Update Vol. 1")
-
-    def test_create_blog_post_with_guest_author_override(self):
-        post = BlogPost.objects.create(
-            title="Guest Contribution: The Future of AI",
-            author=self.uplas_user_author, # Uplas user still linked (e.g., as internal publisher)
-            author_profile_override=self.guest_author_profile,
-            content_html="<p>An insightful piece by a guest.</p>",
+        cls.post_draft = BlogPost.objects.create(
+            author=cls.author_user,
+            category=cls.cat_tutorials,
+            title='Draft: Python List Comprehensions',
+            # Slug will be auto-generated by save()
+            excerpt='Quick guide to list comprehensions.',
+            content_markdown='List comprehensions offer a concise way to create lists.',
             status='draft'
         )
-        self.assertEqual(post.author_profile_override, self.guest_author_profile)
-        self.assertEqual(post.display_author_name, self.guest_author_profile.display_name)
-        self.assertEqual(post.status, 'draft')
-        self.assertIsNone(post.publish_date) # Not published yet
+        cls.post_draft.tags.add(cls.tag_python)
+
+        # Create a Blog Comment
+        cls.comment1_on_published = BlogComment.objects.create(
+            blog_post=cls.post_published,
+            author=cls.commenter_user,
+            content='Great article, very informative!'
+        )
+        # comment_count signal should update post_published
+
+        cls.comment2_reply_to_c1 = BlogComment.objects.create(
+            blog_post=cls.post_published,
+            author=cls.author_user, # Author replying
+            parent_comment=cls.comment1_on_published,
+            content='Thanks for the feedback!'
+        )
+
+        cls.comment3_unapproved = BlogComment.objects.create(
+            blog_post=cls.post_published,
+            author=cls.commenter_user,
+            content='This comment needs approval.',
+            is_approved=False
+        )
+
+
+class BlogCategoryModelTests(BlogModelTestDataMixin, TestCase):
+    def test_blog_category_creation(self):
+        self.assertEqual(self.cat_tech.name, 'Technology')
+        self.assertEqual(self.cat_tech.slug, 'technology')
+        self.assertEqual(self.cat_tech.post_count, 0) # Initially 0, updated by BlogPost signal
+        self.assertEqual(str(self.cat_tech), 'Technology')
+
+    def test_blog_category_name_uniqueness(self):
+        with self.assertRaises(IntegrityError):
+            BlogCategory.objects.create(name='Technology', slug='tech-new')
+
+    def test_blog_category_slug_uniqueness(self):
+        with self.assertRaises(IntegrityError):
+            BlogCategory.objects.create(name='Tech New', slug='technology')
+
+
+class BlogPostTagModelTests(BlogModelTestDataMixin, TestCase):
+    def test_blog_post_tag_creation(self):
+        self.assertEqual(self.tag_python.name, 'Python')
+        self.assertEqual(self.tag_python.slug, 'python')
+        self.assertEqual(str(self.tag_python), 'Python')
+
+    def test_blog_post_tag_name_uniqueness(self):
+        with self.assertRaises(IntegrityError):
+            BlogPostTag.objects.create(name='Python', slug='python-new-slug')
+
+    def test_blog_post_tag_slug_uniqueness(self):
+        with self.assertRaises(IntegrityError):
+            BlogPostTag.objects.create(name='Python New Name', slug='python')
+
+
+class BlogPostModelTests(BlogModelTestDataMixin, TestCase):
+    def test_blog_post_creation_published(self):
+        self.assertEqual(self.post_published.title, 'Understanding Django Signals')
+        self.assertEqual(self.post_published.author, self.author_user)
+        self.assertEqual(self.post_published.category, self.cat_tech)
+        self.assertEqual(self.post_published.status, 'published')
+        self.assertIsNotNone(self.post_published.published_at) # Set by save()
+        self.assertEqual(self.post_published.tags.count(), 2)
+        self.assertIn(self.tag_django, self.post_published.tags.all())
+        self.assertEqual(str(self.post_published), 'Understanding Django Signals')
+        self.assertEqual(self.post_published.view_count, 0)
+        self.assertEqual(self.post_published.like_count, 0)
+        # comment_count is tested via signal below
+
+    def test_blog_post_creation_draft(self):
+        self.assertEqual(self.post_draft.status, 'draft')
+        self.assertIsNone(self.post_draft.published_at) # Should not be set for drafts
+        self.assertEqual(self.post_draft.slug, slugify(self.post_draft.title)) # Auto-generated
 
     def test_blog_post_slug_uniqueness(self):
-        title = "Unique Slug Test Post"
-        BlogPost.objects.create(author=self.uplas_user_author, title=title, content_html="c1")
-        post2 = BlogPost.objects.create(author=self.uplas_user_author, title=title, content_html="c2")
-        self.assertNotEqual(post1.slug, post2.slug) # post1 not defined, error in original. Should be:
-        # self.assertNotEqual(BlogPost.objects.get(content_html="c1").slug, post2.slug)
-        self.assertTrue(post2.slug.startswith(slugify(title) + "-"))
+        with self.assertRaises(IntegrityError):
+            BlogPost.objects.create(
+                author=self.author_user, title='Another Signal Post',
+                slug='understanding-django-signals', # Duplicate
+                content_markdown='Test content'
+            )
 
-
-    def test_blog_post_publish_date_logic(self):
-        post = BlogPost.objects.create(author=self.uplas_user_author, title="To Be Published", content_html="c", status='draft')
-        self.assertIsNone(post.publish_date)
-        
-        post.status = 'published'
-        post.save()
-        self.assertIsNotNone(post.publish_date)
-        self.assertTrue(timezone.now() - post.publish_date < timezone.timedelta(seconds=5))
-
-        # Test if changing status back to draft clears publish_date (current model logic does not)
-        # post.status = 'draft'
-        # post.save()
-        # self.assertIsNone(post.publish_date) # This would fail with current model save
-
-    def test_excerpt_and_meta_generation(self):
-        long_content = "<p>This is a very long piece of content designed to test the automatic generation of an excerpt. It should be more than three hundred characters long to ensure that the truncation logic with an ellipsis is properly triggered. We will keep writing until we are sure it is long enough for this specific test case. Almost there now, just a few more words should suffice. Okay, this should be enough now.</p>"
-        short_content = "<p>Short and sweet.</p>"
-
-        post_long = BlogPost.objects.create(author=self.uplas_user_author, title="Long", content_html=long_content)
-        self.assertTrue(post_long.excerpt.endswith("..."))
-        self.assertTrue(len(post_long.excerpt) <= 300) # 297 + "..."
-        self.assertEqual(post_long.meta_description, post_long.excerpt[:160])
-
-        post_short = BlogPost.objects.create(author=self.uplas_user_author, title="Short", content_html=short_content)
-        self.assertEqual(post_short.excerpt, strip_tags(short_content))
-        self.assertFalse(post_short.excerpt.endswith("..."))
-        self.assertEqual(post_short.meta_description, post_short.excerpt)
-
-
-class BlogCommentModelTests(TestCase):
-    def setUp(self):
-        self.blog_author = User.objects.create_user(email="blog_author_comment@example.com", password="password")
-        self.commenter_user = User.objects.create_user(email="commenter_user@example.com", password="password", full_name="Commenter User")
-        self.post = BlogPost.objects.create(author=self.blog_author, title="Post for Comments", content_html="...")
-        
-        # Simulate avatar on commenter_user
-        # from apps.users.models import UserProfile
-        # profile, _ = UserProfile.objects.get_or_create(user=self.commenter_user)
-        # profile.profile_picture_url = "http://example.com/commenter_avatar.png"
-        # profile.save()
-        # OR if directly on user
-        self.commenter_user.profile_picture_url = "http://example.com/commenter_avatar.png"
-        self.commenter_user.save()
-
-
-    def test_create_blog_comment_by_authenticated_user(self):
-        comment = BlogComment.objects.create(
-            post=self.post,
-            author=self.commenter_user,
-            content="This is a great post!"
+    def test_blog_post_auto_slug_uniqueness_on_save(self):
+        # Create a post that would generate the same initial slug as post_draft
+        post_same_title = BlogPost.objects.create(
+            author=self.author_user,
+            title=self.post_draft.title, # Same title
+            content_markdown="Content for slug test"
         )
-        self.assertEqual(comment.post, self.post)
-        self.assertEqual(comment.author, self.commenter_user)
-        self.assertEqual(comment.author_name, "") # Guest field should be blank
-        self.assertEqual(comment.content, "This is a great post!")
-        self.assertTrue(comment.is_approved) # Default
-        self.assertEqual(str(comment), f"Comment by {self.commenter_user.email} on '{self.post.title}'")
-        self.assertEqual(comment.commenter_display_name, self.commenter_user.full_name)
-        self.assertEqual(comment.commenter_avatar_url, self.commenter_user.profile_picture_url)
+        # The save() method should append a counter to make it unique
+        self.assertNotEqual(post_same_title.slug, self.post_draft.slug)
+        self.assertTrue(post_same_title.slug.startswith(self.post_draft.slug + '-'))
 
 
-    def test_create_blog_comment_by_guest(self):
-        comment = BlogComment.objects.create(
-            post=self.post,
-            author_name="Guest Visitor",
-            author_email="guest@visitor.com", # Optional
-            content="Nice article from a guest."
+    def test_published_at_logic_on_save(self):
+        # Test draft to published
+        self.post_draft.status = 'published'
+        self.post_draft.save()
+        self.post_draft.refresh_from_db()
+        self.assertIsNotNone(self.post_draft.published_at)
+        first_published_time = self.post_draft.published_at
+
+        # Test saving again while published (should not change published_at)
+        self.post_draft.title = "Updated Draft Title Now Published"
+        self.post_draft.save()
+        self.post_draft.refresh_from_db()
+        self.assertEqual(self.post_draft.published_at, first_published_time)
+
+        # Test published to draft (published_at behavior based on model logic - currently keeps it)
+        self.post_draft.status = 'draft'
+        self.post_draft.save()
+        self.post_draft.refresh_from_db()
+        self.assertEqual(self.post_draft.published_at, first_published_time) # Current logic keeps it
+
+    def test_category_post_count_signal_on_blogpost_save_delete(self):
+        self.cat_tech.refresh_from_db()
+        # post_published is in cat_tech and published
+        self.assertEqual(self.cat_tech.post_count, 1)
+
+        # Add another published post to cat_tech
+        post_new_published = BlogPost.objects.create(
+            author=self.author_user, category=self.cat_tech, title="New Tech Post",
+            content_markdown="...", status='published'
         )
-        self.assertIsNone(comment.author) # No Uplas User linked
-        self.assertEqual(comment.author_name, "Guest Visitor")
-        self.assertEqual(comment.content, "Nice article from a guest.")
-        self.assertEqual(str(comment), f"Comment by Guest Visitor on '{self.post.title}'")
-        self.assertEqual(comment.commenter_display_name, "Guest Visitor")
-        self.assertTrue("Guest-Visitor" in comment.commenter_avatar_url) # Check placeholder from ui-avatars
+        self.cat_tech.refresh_from_db()
+        self.assertEqual(self.cat_tech.post_count, 2)
 
-    def test_create_threaded_blog_comment(self):
-        parent_comment = BlogComment.objects.create(post=self.post, author=self.commenter_user, content="Parent text")
-        reply = BlogComment.objects.create(
-            post=self.post,
-            author=self.commenter_user,
-            content="This is a reply.",
-            parent_comment=parent_comment
+        # Change status of post_new_published to draft
+        post_new_published.status = 'draft'
+        post_new_published.save()
+        self.cat_tech.refresh_from_db()
+        self.assertEqual(self.cat_tech.post_count, 1) # Should decrease
+
+        # Delete post_published
+        self.post_published.delete()
+        self.cat_tech.refresh_from_db()
+        self.assertEqual(self.cat_tech.post_count, 0)
+
+
+class BlogCommentModelTests(BlogModelTestDataMixin, TestCase):
+    def test_blog_comment_creation(self):
+        self.assertEqual(self.comment1_on_published.blog_post, self.post_published)
+        self.assertEqual(self.comment1_on_published.author, self.commenter_user)
+        self.assertIn('Great article', self.comment1_on_published.content)
+        self.assertTrue(self.comment1_on_published.is_approved) # Default
+        self.assertFalse(self.comment1_on_published.is_hidden_by_user)
+        self.assertFalse(self.comment1_on_published.is_hidden_by_moderator)
+        self.assertTrue(self.comment1_on_published.is_publicly_visible)
+        self.assertEqual(self.comment1_on_published.like_count, 0)
+        expected_str = f"Comment by {self.commenter_user.email} on '{self.post_published.title}'"
+        self.assertEqual(str(self.comment1_on_published), expected_str)
+
+    def test_threaded_comment_creation(self):
+        self.assertEqual(self.comment2_reply_to_c1.parent_comment, self.comment1_on_published)
+        self.assertEqual(self.comment1_on_published.replies.count(), 1)
+        self.assertIn(self.comment2_reply_to_c1, self.comment1_on_published.replies.all())
+
+    def test_is_publicly_visible_property(self):
+        # Approved, not hidden
+        self.assertTrue(self.comment1_on_published.is_publicly_visible)
+
+        # Unapproved
+        self.comment1_on_published.is_approved = False
+        self.comment1_on_published.save()
+        self.assertFalse(self.comment1_on_published.is_publicly_visible)
+        self.comment1_on_published.is_approved = True; self.comment1_on_published.save() # Reset
+
+        # Hidden by user
+        self.comment1_on_published.is_hidden_by_user = True
+        self.comment1_on_published.save()
+        self.assertFalse(self.comment1_on_published.is_publicly_visible)
+        self.comment1_on_published.is_hidden_by_user = False; self.comment1_on_published.save() # Reset
+
+        # Hidden by moderator
+        self.comment1_on_published.is_hidden_by_moderator = True
+        self.comment1_on_published.save()
+        self.assertFalse(self.comment1_on_published.is_publicly_visible)
+
+    def test_blog_post_comment_count_signal_on_comment_save_delete(self):
+        self.post_published.refresh_from_db()
+        # comment1, comment2_reply, comment3_unapproved (but signal counts only approved/visible)
+        # comment1 and comment2 are approved and visible by default
+        expected_initial_count = 2
+        self.assertEqual(self.post_published.comment_count, expected_initial_count)
+
+        # Add a new approved comment
+        comment4_approved = BlogComment.objects.create(
+            blog_post=self.post_published, author=self.user1, content="Another approved comment."
         )
-        self.assertEqual(reply.parent_comment, parent_comment)
-        self.assertIn(reply, parent_comment.replies.all())
+        self.post_published.refresh_from_db()
+        self.assertEqual(self.post_published.comment_count, expected_initial_count + 1)
 
-# Helper for excerpt generation (used in BlogPost model)
-from django.utils.html import strip_tags
+        # Unapprove comment4
+        comment4_approved.is_approved = False
+        comment4_approved.save()
+        self.post_published.refresh_from_db()
+        self.assertEqual(self.post_published.comment_count, expected_initial_count) # Should decrease
+
+        # Delete comment1 (which was approved)
+        self.comment1_on_published.delete()
+        self.post_published.refresh_from_db()
+        # Now only comment2_reply_to_c1 should be counted from the initial set
+        self.assertEqual(self.post_published.comment_count, 1)
+
+
+# Tests for GenericRelation 'likes' on BlogPost and BlogComment
+# These depend on having a Like model (e.g., from apps.community)
+# and its signals correctly updating the target object's like_count.
+# For now, we'll assume BlogPost and BlogComment have a 'like_count' field
+# and the GenericRelation is set up. The actual increment/decrement logic
+# would be in the Like model's signal.
+
+# Example (if Like model and its signals are available and configured):
+# class BlogPostLikeSignalTests(BlogModelTestDataMixin, TestCase):
+#     def setUp(self):
+#         super().setUpTestData()
+#         # Ensure Like model is imported if used from another app
+#         # from apps.community.models import Like
+#         self.blog_post_ct = ContentType.objects.get_for_model(BlogPost)
+
+#     def test_like_creation_updates_blog_post_like_count(self):
+#         initial_likes = self.post_published.like_count
+#         # Simulate creating a Like for self.post_published
+#         # This assumes community.Like model exists and has a signal to update target.like_count
+#         # Like.objects.create(user=self.commenter_user, content_type=self.blog_post_ct, object_id=self.post_published.id)
+#         # self.post_published.refresh_from_db()
+#         # self.assertEqual(self.post_published.like_count, initial_likes + 1)
+#         pass # Placeholder until Like model and its signals are fully integrated and testable here
+
+# Add more tests for:
+# - Slug generation edge cases (e.g., very long titles, titles with special characters).
+# - Behavior when author or category is None for BlogPost.
+# - Deletion cascades if specific on_delete behaviors need verification beyond Django defaults.
+# - Any other custom methods or properties on the models.
