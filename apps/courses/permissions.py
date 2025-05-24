@@ -1,129 +1,214 @@
- from rest_framework import permissions
-from .models import UserCourseEnrollment, Topic, Course # Ensure Course is imported
+from rest_framework.permissions import BasePermission, SAFE_METHODS
+from .models import Course, Module, Topic, Question, Choice, Enrollment, CourseReview
 
-class IsInstructorOrReadOnly(permissions.BasePermission):
+class IsAdminOrReadOnly(BasePermission):
     """
-    Custom permission to only allow instructors of a course object to edit it.
-    Read-only for everyone else.
+    Allows full access to admin users, read-only for others.
     """
-    def has_object_permission(self, request, view, obj):
-        if request.method in permissions.SAFE_METHODS:
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
             return True
-        
-        # For Course objects
-        if isinstance(obj, Course):
-            return obj.instructor == request.user
-        # For Module objects, check instructor of parent course
-        if hasattr(obj, 'course') and isinstance(obj.course, Course):
-             return obj.course.instructor == request.user
-        # For Topic, Quiz, Question, AnswerOption objects, check instructor of grandparent/great-grandparent course
-        if hasattr(obj, 'module') and hasattr(obj.module, 'course') and isinstance(obj.module.course, Course): # Topic
-             return obj.module.course.instructor == request.user
-        if hasattr(obj, 'topic') and hasattr(obj.topic, 'module') and hasattr(obj.topic.module, 'course'): # Quiz
-            return obj.topic.module.course.instructor == request.user
-        if hasattr(obj, 'quiz') and hasattr(obj.quiz, 'topic') and hasattr(obj.quiz.topic, 'module'): # Question
-            return obj.quiz.topic.module.course.instructor == request.user
-        if hasattr(obj, 'question') and hasattr(obj.question, 'quiz') and hasattr(obj.question.quiz, 'topic'): # AnswerOption
-            return obj.question.quiz.topic.module.course.instructor == request.user
-            
-        return False # Default to no permission if object structure is unexpected
+        return request.user and request.user.is_staff
 
-class IsEnrolled(permissions.BasePermission):
+class IsInstructorOrReadOnly(BasePermission):
     """
-    Checks if the user is enrolled in the course related to the object.
-    This permission is typically used for actions like submitting a quiz or marking a topic complete.
+    Allows read access to everyone.
+    Allows write access only to the instructor of the course or admin users.
+    This permission is checked at the object level.
     """
-    def _get_course_from_object_or_view(self, obj, view):
-        """Helper to extract course from object or view kwargs."""
-        course = None
-        if isinstance(obj, Course):
-            course = obj
-        elif hasattr(obj, 'course') and isinstance(obj.course, Course): # e.g., Module, Review
-            course = obj.course
-        elif hasattr(obj, 'module') and hasattr(obj.module, 'course') and isinstance(obj.module.course, Course): # e.g., Topic
-            course = obj.module.course
-        elif hasattr(obj, 'topic') and hasattr(obj.topic, 'module') and hasattr(obj.topic.module, 'course'): # e.g., Quiz
-            course = obj.topic.module.course
-        
-        if not course: # Try to get from view kwargs if object context isn't direct
-            course_slug = view.kwargs.get('course_slug') or view.kwargs.get('slug') # CourseViewSet uses 'slug'
-            topic_slug = view.kwargs.get('topic_slug') # TopicViewSet uses 'slug' for topic
-            
-            if topic_slug: # If topic_slug is present, it has higher precedence for course context
-                try:
-                    topic_obj = Topic.objects.select_related('module__course').get(slug=topic_slug)
-                    course = topic_obj.module.course
-                except Topic.DoesNotExist:
-                    return None
-            elif course_slug:
-                 try:
-                    course = Course.objects.get(slug=course_slug)
-                 except Course.DoesNotExist:
-                    return None
-        return course
+    def has_object_permission(self, request, view, obj):
+        # Read permissions are allowed to any request,
+        # so we'll always allow GET, HEAD or OPTIONS requests.
+        if request.method in SAFE_METHODS:
+            return True
 
-    def has_permission(self, request, view): # For list views or viewset-level checks
-        if not request.user or not request.user.is_authenticated:
+        # Write permissions are only allowed to the instructor of the course or admin.
+        if not request.user.is_authenticated:
             return False
-        # For viewset actions that don't operate on a specific object yet (e.g. creating an enrollment)
-        # this permission might be too broad or need specific handling in the view.
-        # Usually, IsEnrolled is best as an object permission.
-        # If used as view permission, ensure view provides course context (e.g., from URL).
         
-        # Example: If view is for a specific course (e.g. listing modules of a course user must be enrolled in to see)
-        course_slug = view.kwargs.get('course_slug') or view.kwargs.get('slug')
-        if course_slug:
-            try:
-                course = Course.objects.get(slug=course_slug)
-                return UserCourseEnrollment.objects.filter(user=request.user, course=course).exists()
-            except Course.DoesNotExist:
-                return False # Course not found, deny permission (or let view 404)
-        return True # Default to true if no specific course context at view level, rely on object permission
+        if request.user.is_staff: # Admin can do anything
+            return True
+
+        course_instructor = None
+        if isinstance(obj, Course):
+            course_instructor = obj.instructor
+        elif isinstance(obj, Module):
+            course_instructor = obj.course.instructor
+        elif isinstance(obj, Topic):
+            course_instructor = obj.module.course.instructor
+        elif isinstance(obj, Question):
+            course_instructor = obj.topic.module.course.instructor
+        elif isinstance(obj, Choice):
+            course_instructor = obj.question.topic.module.course.instructor
+        
+        return course_instructor == request.user
+
+
+class IsEnrolled(BasePermission):
+    """
+    Allows access only to users enrolled in the course.
+    This permission is typically checked at the object level for course-related objects
+    or at the view level if the view context provides a course.
+    """
+    message = "You must be enrolled in this course to perform this action."
+
+    def _get_course_from_obj(self, obj):
+        """Helper to get course from various objects."""
+        if isinstance(obj, Course):
+            return obj
+        if hasattr(obj, 'course') and isinstance(obj.course, Course): # Module, Enrollment, CourseReview, CourseProgress
+            return obj.course
+        if hasattr(obj, 'module') and hasattr(obj.module, 'course'): # Topic
+            return obj.module.course
+        if hasattr(obj, 'topic') and hasattr(obj.topic, 'module'): # Question, QuizAttempt
+            return obj.topic.module.course
+        if hasattr(obj, 'question') and hasattr(obj.question, 'topic'): # Choice
+            return obj.question.topic.module.course
+        return None
+
+    def has_permission(self, request, view):
+        if not request.user.is_authenticated:
+            return False
+        
+        # Try to get course from view (e.g., if it's a nested route or view explicitly sets it)
+        course = getattr(view, 'course_object', None) 
+        if not course and hasattr(view, 'kwargs'):
+            course_id = view.kwargs.get('course_pk') or view.kwargs.get('course_id')
+            if course_id:
+                try:
+                    course = Course.objects.get(pk=course_id)
+                except Course.DoesNotExist:
+                    return False # Course not found, deny permission
+        
+        if course:
+            return Enrollment.objects.filter(user=request.user, course=course).exists()
+        
+        # If no course context at view level, rely on object permission or deny if strictly needed here
+        # For some views, object permission is sufficient.
+        return True # Fallback to object permission if no course context at view level
 
     def has_object_permission(self, request, view, obj):
-        if not request.user or not request.user.is_authenticated:
+        if not request.user.is_authenticated:
             return False
         
-        course = self._get_course_from_object_or_view(obj, view)
+        course = self._get_course_from_obj(obj)
         if not course:
-            return False # Cannot determine course context
+            # If we can't determine the course from the object,
+            # and it's not a safe method, deny.
+            # Safe methods might be allowed if view-level permissions are sufficient.
+            return request.method in SAFE_METHODS 
             
-        return UserCourseEnrollment.objects.filter(user=request.user, course=course).exists()
+        return Enrollment.objects.filter(user=request.user, course=course).exists()
 
 
-class IsEnrolledOrPreviewable(permissions.BasePermission):
+class CanViewTopicContent(BasePermission):
     """
-    Allows access if user is enrolled OR the topic is previewable.
-    Primarily for Topic read access.
+    Allows viewing topic content if:
+    - User is enrolled in the course.
+    - Topic is previewable and course is published.
+    - Course is free and published.
+    - User is the instructor or admin.
     """
-    def has_object_permission(self, request, view, obj): # obj is expected to be a Topic instance
+    message = "You do not have permission to view this topic's content."
+
+    def has_object_permission(self, request, view, obj):
+        # Object must be a Topic instance
         if not isinstance(obj, Topic):
-            # This permission is specifically for Topics. If applied to something else,
-            # it should probably allow or deny based on other criteria.
-            # For safety, let's assume it's only for topics.
-            return True # Or False, depending on desired default for non-Topic objects
+            return False # Or True if not a topic, to let other permissions handle it
 
+        course = obj.module.course
+
+        if not course.is_published and not (request.user.is_authenticated and (request.user.is_staff or course.instructor == request.user)):
+            return False # Non-instructors/admins cannot see unpublished content
+
+        if request.user.is_authenticated:
+            if request.user.is_staff or course.instructor == request.user:
+                return True
+            if Enrollment.objects.filter(user=request.user, course=course).exists():
+                return True
+        
+        # For both authenticated (but not enrolled/instructor) and unauthenticated users:
         if obj.is_previewable:
             return True
-        
-        # If not previewable, user must be authenticated and enrolled
-        if not request.user or not request.user.is_authenticated:
-            return False
-        
-        return UserCourseEnrollment.objects.filter(user=request.user, course=obj.module.course).exists()
-
-class CanReviewCourse(permissions.BasePermission):
-    """
-    Allows a user to create/edit/delete a review if they are enrolled in the course
-    and haven't reviewed it yet (for create), or if they are the author of the review (for edit/delete).
-    """
-    def has_permission(self, request, view): # For POST (create)
-        if not request.user or not request.user.is_authenticated:
-            return False
-        return True # Further checks in has_object_permission or view's perform_create
-
-    def has_object_permission(self, request, view, obj): # obj is a Review instance for PUT/DELETE
-        if request.method in permissions.SAFE_METHODS: # GET, HEAD, OPTIONS
+        if course.is_free:
             return True
-        # For PUT, PATCH, DELETE, user must be the author of the review
-        return obj.user == request.user
+            
+        return False
+
+
+class CanPerformEnrolledAction(BasePermission):
+    """
+    Allows actions like marking topics complete or submitting quizzes if enrolled.
+    Assumes the object is a Topic or related to a Topic (e.g., QuizAttempt).
+    """
+    message = "You must be enrolled in the course to perform this action."
+
+    def has_object_permission(self, request, view, obj):
+        if not request.user.is_authenticated:
+            return False
+
+        course = None
+        if isinstance(obj, Topic):
+            course = obj.module.course
+        elif hasattr(obj, 'topic') and isinstance(obj.topic, Topic): # e.g. QuizAttempt
+             course = obj.topic.module.course
+        else:
+            # Try to get course from view context if object itself isn't a Topic
+            # This might be needed if the permission is on a view directly
+            # that doesn't pass a Topic object but has course context.
+            # For now, assume obj is Topic or has a direct 'topic' attribute.
+            return False 
+
+        if not course or not course.is_published:
+             # Allow instructors/admins to interact even if unpublished
+            if request.user.is_staff or (course and course.instructor == request.user):
+                pass # Allow to proceed to enrollment check or other logic
+            else:
+                return False
+
+        is_enrolled = Enrollment.objects.filter(user=request.user, course=course).exists()
+        
+        # Instructors/staff can perform these actions regardless of enrollment (for testing/management)
+        if request.user.is_staff or (course and course.instructor == request.user):
+            return True
+            
+        return is_enrolled
+
+
+class CanSubmitCourseReview(BasePermission):
+    """
+    Allows a user to submit a review if they are enrolled and haven't reviewed the course yet.
+    """
+    message = "You must be enrolled and not have already reviewed this course to submit a review."
+
+    def has_permission(self, request, view):
+        # This permission is typically used on a create-only view.
+        # The course_id should be in the request data or view kwargs.
+        if not request.user.is_authenticated:
+            return False
+        return True # Further checks in has_object_permission or serializer validation
+
+    def has_object_permission(self, request, view, obj):
+        # This method is more relevant if updating/deleting own review.
+        # For creating, the check is usually done in the view or serializer.
+        # If obj is a CourseReview instance (for PUT/DELETE):
+        if isinstance(obj, CourseReview):
+            return obj.user == request.user or request.user.is_staff
+        
+        # If obj is a Course instance (for POSTing a new review to this course):
+        if isinstance(obj, Course):
+            if not request.user.is_authenticated:
+                return False
+            
+            is_enrolled = Enrollment.objects.filter(user=request.user, course=obj).exists()
+            if not is_enrolled:
+                self.message = "You must be enrolled in the course to submit a review."
+                return False
+            
+            has_reviewed = CourseReview.objects.filter(user=request.user, course=obj).exists()
+            if has_reviewed:
+                self.message = "You have already reviewed this course."
+                return False
+            return True
+        
+        return False # Default deny if object type is not handled
