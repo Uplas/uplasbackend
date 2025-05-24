@@ -1,335 +1,393 @@
 from django.test import TestCase
 from django.contrib.auth import get_user_model
-from django.conf import settings
-from rest_framework.test import APIRequestFactory # To create mock request for context
+from rest_framework.test import APIRequestFactory # For providing request context to serializers
+from rest_framework.exceptions import ValidationError
 from decimal import Decimal
 
-from ..models import (
-    CourseCategory, Course, Module, Topic, Quiz, Question, AnswerOption,
-    UserCourseEnrollment, UserTopicAttempt, Review
+# Import models and serializers from the courses app
+from apps.courses.models import (
+    Category, Course, Module, Topic, Question, Choice,
+    Enrollment, CourseReview, CourseProgress, TopicProgress, QuizAttempt
 )
-from ..serializers import (
-    CourseCategorySerializer, CourseSerializer, CourseDetailSerializer,
-    ModuleSerializer, TopicSerializer, QuizSerializer, QuestionSerializer, AnswerOptionSerializer, AnswerOptionStudentViewSerializer,
-    UserCourseEnrollmentSerializer, UserTopicAttemptSerializer, BasicUserTopicAttemptSerializer, ReviewSerializer,
-    QuizSubmissionSerializer, SubmitAnswerSerializer
+from apps.courses.serializers import (
+    CategorySerializer,
+    CourseListSerializer, CourseDetailSerializer,
+    ModuleListSerializer, ModuleDetailSerializer,
+    TopicListSerializer, TopicDetailSerializer,
+    QuestionSerializer, ChoiceSerializer,
+    EnrollmentSerializer, CourseReviewSerializer,
+    QuizSubmissionSerializer, QuizAttemptResultSerializer,
+    TopicProgressSerializer
 )
-# Assuming BasicUserSerializer is defined in courses.serializers or imported if in users.serializers
-# from apps.users.serializers import BasicUserSerializer # If it's there
+
+# Import the test data mixin from test_models.py
+# Assuming test_models.py is in the same directory or accessible via python path
+# For this standalone example, we might need to redefine it or ensure it's importable.
+# For now, let's redefine a simplified version for clarity if direct import isn't feasible in this context.
 
 User = get_user_model()
 
-# If BasicUserSerializer is not defined elsewhere for this test file, define a minimal one.
-class BasicUserSerializerForTest(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ['id', 'username', 'full_name']
-
-
-class CourseCategorySerializerTests(TestCase):
-    def test_category_serializer_valid_data(self):
-        category_data = {"name": "Machine Learning", "description": "Learn ML"}
-        serializer = CourseCategorySerializer(data=category_data)
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-        category = serializer.save()
-        self.assertEqual(category.name, category_data["name"])
-
-    def test_category_serializer_output_data(self):
-        category = CourseCategory.objects.create(name="Data Science")
-        serializer = CourseCategorySerializer(category)
-        self.assertEqual(serializer.data['name'], "Data Science")
-        self.assertIn('slug', serializer.data)
-
-
-class CourseSerializersTests(TestCase):
-    def setUp(self):
-        self.instructor = User.objects.create_user(email="courseinst@example.com", password="password", full_name="Course Instructor")
-        self.category = CourseCategory.objects.create(name="Python Programming")
-        self.course = Course.objects.create(
-            title="Complete Python Bootcamp",
-            subtitle="From zero to hero",
-            description_html="<p>Content</p>",
-            category=self.category,
-            instructor=self.instructor,
-            price=Decimal("19.99"),
-            difficulty_level='beginner',
-            is_published=True,
-            published_date=timezone.now()
+# Re-defining a simplified version of the TestDataMixin for serializer tests.
+# In a real project, you'd import this from your test_models.py or a common test utils file.
+class SerializerTestDataMixin:
+    @classmethod
+    def setUpTestData(cls):
+        cls.instructor_user = User.objects.create_user(
+            username='ser_instructor', email='ser_instructor@example.com', password='password123',
+            full_name='Serializer Instructor', is_instructor=True
         )
-        self.module = Module.objects.create(course=self.course, title="Introduction", order=1)
-        self.topic = Topic.objects.create(module=self.module, title="Hello World", order=1)
+        cls.student_user = User.objects.create_user(
+            username='ser_student', email='ser_student@example.com', password='password123',
+            full_name='Serializer Student'
+        )
+        cls.another_student = User.objects.create_user(
+            username='ser_student2', email='ser_student2@example.com', password='password123',
+            full_name='Another Student'
+        )
 
-        # For request context in serializers
-        self.factory = APIRequestFactory()
-        self.request = self.factory.get('/')
-        self.user = User.objects.create_user(email="student@example.com", password="password")
-        self.request.user = self.user # Simulate authenticated user
+        cls.category = Category.objects.create(name='Serializer Testing', slug='serializer-testing')
+        cls.course = Course.objects.create(
+            title='Course for Serializer Test', slug='course-serializer-test',
+            instructor=cls.instructor_user, category=cls.category,
+            short_description='Testing serializers.', price=Decimal('19.99'), currency='USD',
+            is_published=True, supports_ai_tutor=True
+        )
+        cls.module = Module.objects.create(course=cls.course, title='Module 1 for Serializer', order=1)
+        cls.topic1 = Topic.objects.create(
+            module=cls.module, title='Topic 1 for Serializer', slug='topic-1-serializer', order=1,
+            content={'type': 'text', 'text_content': 'Test content'}, estimated_duration_minutes=5
+        )
+        cls.topic2 = Topic.objects.create(
+            module=cls.module, title='Topic 2 for Serializer', slug='topic-2-serializer', order=2,
+            content={'type': 'text', 'text_content': 'More content'}, estimated_duration_minutes=10,
+            is_previewable=True
+        )
+        cls.question1_t1 = Question.objects.create(topic=cls.topic1, text="Q1?", question_type='single-choice', order=1)
+        cls.choice1_q1 = Choice.objects.create(question=cls.question1_t1, text="Correct", is_correct=True, order=1)
+        cls.choice2_q1 = Choice.objects.create(question=cls.question1_t1, text="Incorrect", is_correct=False, order=2)
 
-    def test_course_serializer_output_data(self):
-        """Test CourseSerializer basic output for a published course."""
-        # Simulate annotation that view would do
-        setattr(self.course, 'is_enrolled_annotated', False)
-        setattr(self.course, 'current_user_progress_annotated', None)
+        cls.question2_t1 = Question.objects.create(topic=cls.topic1, text="Q2 Multi?", question_type='multiple-choice', order=2)
+        cls.choice1_q2 = Choice.objects.create(question=cls.question2_t1, text="Correct A", is_correct=True, order=1)
+        cls.choice2_q2 = Choice.objects.create(question=cls.question2_t1, text="Correct B", is_correct=True, order=2)
+        cls.choice3_q2 = Choice.objects.create(question=cls.question2_t1, text="Incorrect C", is_correct=False, order=3)
 
-        serializer = CourseSerializer(self.course, context={'request': self.request})
+        # For providing request context to serializers
+        cls.factory = APIRequestFactory()
+
+
+class CategorySerializerTests(SerializerTestDataMixin, TestCase):
+    def test_category_serialization(self):
+        serializer = CategorySerializer(instance=self.category)
         data = serializer.data
+        self.assertEqual(data['name'], self.category.name)
+        self.assertEqual(data['slug'], self.category.slug)
+        self.assertIn('id', data)
+
+    def test_category_deserialization_create(self):
+        data = {'name': 'New Category', 'slug': 'new-category', 'description': 'A new one'}
+        serializer = CategorySerializer(data=data)
+        self.assertTrue(serializer.is_valid())
+        category = serializer.save()
+        self.assertEqual(category.name, 'New Category')
+
+    def test_category_deserialization_update(self):
+        data = {'name': 'Updated Category Name', 'slug': self.category.slug} # Slug must be unique
+        serializer = CategorySerializer(instance=self.category, data=data, partial=True)
+        self.assertTrue(serializer.is_valid())
+        category = serializer.save()
+        self.assertEqual(category.name, 'Updated Category Name')
+
+
+class CourseSerializersTests(SerializerTestDataMixin, TestCase):
+    def test_course_list_serializer(self):
+        # Mock request for context
+        request = self.factory.get('/fake-url/')
+        request.user = self.student_user # Simulate a logged-in student
+
+        Enrollment.objects.create(user=self.student_user, course=self.course) # Enroll student
+
+        serializer = CourseListSerializer(instance=self.course, context={'request': request})
+        data = serializer.data
+
         self.assertEqual(data['title'], self.course.title)
-        self.assertEqual(data['instructor']['full_name'], self.instructor.full_name)
-        self.assertEqual(data['category']['name'], self.category.name)
-        self.assertFalse(data['is_enrolled']) # Based on SerializerMethodField logic
-        self.assertIsNone(data['enrollment_progress'])
+        self.assertEqual(data['instructor_name'], self.instructor_user.full_name)
+        self.assertTrue(data['is_enrolled']) # Student is enrolled
+        self.assertIn('total_duration_minutes', data)
 
-    def test_course_serializer_enrollment_data_when_enrolled(self):
-        """Test CourseSerializer shows enrollment data when user is enrolled."""
-        enrollment = UserCourseEnrollment.objects.create(user=self.user, course=self.course, progress_percentage=25)
-        
-        # Simulate annotations
-        setattr(self.course, 'is_enrolled_annotated', True)
-        setattr(self.course, 'current_user_progress_annotated', 25)
-        
-        # Pass enrollment in context if serializer uses it directly (as a fallback or primary)
-        context = {'request': self.request, f'enrollment_course_{self.course.id}': enrollment}
-        serializer = CourseSerializer(self.course, context=context)
+    def test_course_detail_serializer_read(self):
+        request = self.factory.get('/fake-url/')
+        request.user = self.student_user
+        Enrollment.objects.create(user=self.student_user, course=self.course)
+        TopicProgress.objects.create(user=self.student_user, topic=self.topic1, is_completed=True)
+
+        serializer = CourseDetailSerializer(instance=self.course, context={'request': request})
         data = serializer.data
-        
+
+        self.assertEqual(data['title'], self.course.title)
         self.assertTrue(data['is_enrolled'])
-        self.assertEqual(data['enrollment_progress'], 25)
-
-    def test_course_detail_serializer_includes_modules(self):
-        """Test CourseDetailSerializer includes modules with topics."""
-        # Simulate annotation for detail view (though not strictly necessary if modules are always fetched)
-        setattr(self.course, 'is_enrolled_annotated', False)
-        setattr(self.course, 'current_user_progress_annotated', None)
-
-        serializer = CourseDetailSerializer(self.course, context={'request': self.request})
-        data = serializer.data
-        self.assertIn('modules', data)
+        self.assertTrue(data['user_progress_percentage'] > 0) # Student has made some progress
+        self.assertIsNotNone(data['last_accessed_topic_id']) # Updated by TopicProgress save
         self.assertEqual(len(data['modules']), 1)
         self.assertEqual(data['modules'][0]['title'], self.module.title)
-        self.assertEqual(len(data['modules'][0]['topics']), 1)
-        self.assertEqual(data['modules'][0]['topics'][0]['title'], self.topic.title)
 
-    # Test for Course creation would be more of a view test, as instructor_id/category_id are write_only
-    # but we can test the serializer's create method if it had complex logic (it doesn't currently).
+    def test_course_detail_serializer_create(self):
+        request = self.factory.post('/fake-url/')
+        request.user = self.instructor_user # Instructor creates course
+
+        data = {
+            'title': 'New Advanced Course',
+            'slug': 'new-advanced-course',
+            'category_id': self.category.id,
+            'short_description': 'An advanced topic.',
+            'price': '99.99',
+            'currency': 'USD',
+            'level': 'advanced',
+            'language': 'en',
+            'is_published': False
+        }
+        serializer = CourseDetailSerializer(data=data, context={'request': request})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        course = serializer.save() # instructor is set in serializer.create
+        self.assertEqual(course.title, 'New Advanced Course')
+        self.assertEqual(course.instructor, self.instructor_user)
+
+    def test_course_detail_serializer_update_by_instructor(self):
+        request = self.factory.patch('/fake-url/')
+        request.user = self.instructor_user
+
+        data = {'title': 'Updated Course Title by Instructor', 'is_published': True}
+        serializer = CourseDetailSerializer(instance=self.course, data=data, partial=True, context={'request': request})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        course = serializer.save()
+        self.assertEqual(course.title, 'Updated Course Title by Instructor')
+        self.assertTrue(course.is_published)
 
 
-class ModuleTopicSerializersTests(TestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(email="moduletest@example.com", password="password")
-        self.course = Course.objects.create(title="Module Course", description_html="...")
-        self.module = Module.objects.create(course=self.course, title="First Module", order=1)
-        self.topic1 = Topic.objects.create(module=self.module, title="Topic Alpha", order=1, content_type='text')
-        self.topic2_quiz = Topic.objects.create(module=self.module, title="Topic Beta Quiz", order=2, content_type='quiz')
-        self.quiz = Quiz.objects.create(topic=self.topic2_quiz) # Quiz associated with topic2
-        
-        self.factory = APIRequestFactory()
-        self.request = self.factory.get('/')
-        self.request.user = self.user
+class ModuleSerializersTests(SerializerTestDataMixin, TestCase):
+    def test_module_detail_serializer_read(self):
+        request = self.factory.get('/fake-url/')
+        request.user = self.student_user
+        Enrollment.objects.create(user=self.student_user, course=self.course)
+        TopicProgress.objects.create(user=self.student_user, topic=self.topic1, is_completed=True)
 
-    def test_module_serializer_output(self):
-        serializer = ModuleSerializer(self.module, context={'request': self.request})
+        serializer = ModuleDetailSerializer(instance=self.module, context={'request': request})
         data = serializer.data
         self.assertEqual(data['title'], self.module.title)
-        self.assertEqual(len(data['topics']), 2)
-        self.assertEqual(data['topics'][0]['title'], self.topic1.title)
+        self.assertEqual(len(data['topics']), 2) # topic1 and topic2
+        self.assertTrue(data['user_progress_percentage'] > 0) # Progress on topic1
 
-    def test_topic_serializer_output_text_topic(self):
-        serializer = TopicSerializer(self.topic1, context={'request': self.request})
+class TopicSerializersTests(SerializerTestDataMixin, TestCase):
+    def test_topic_detail_serializer_read(self):
+        request = self.factory.get('/fake-url/')
+        request.user = self.student_user
+        Enrollment.objects.create(user=self.student_user, course=self.course)
+        TopicProgress.objects.create(user=self.student_user, topic=self.topic1, is_completed=True)
+
+        serializer = TopicDetailSerializer(instance=self.topic1, context={'request': request})
         data = serializer.data
         self.assertEqual(data['title'], self.topic1.title)
-        self.assertEqual(data['content_type'], 'text')
-        self.assertIsNone(data['quiz_details'])
-        self.assertIsNone(data['user_progress']) # No enrollment yet
+        self.assertTrue(data['is_completed_by_user'])
+        self.assertEqual(len(data['questions']), 2) # q1 and q2 for topic1
+        self.assertTrue(data['supports_ai_tutor']) # Inherited from course
 
-    def test_topic_serializer_output_quiz_topic(self):
-        # Pass context to indicate it's not student_view for quiz setup
-        context = {'request': self.request, 'student_view': False} 
-        serializer = TopicSerializer(self.topic2_quiz, context=context)
-        data = serializer.data
-        self.assertEqual(data['title'], self.topic2_quiz.title)
-        self.assertEqual(data['content_type'], 'quiz')
-        self.assertIsNotNone(data['quiz_details'])
-        self.assertEqual(data['quiz_details']['id'], str(self.quiz.id))
+class QuestionSerializerTests(SerializerTestDataMixin, TestCase):
+    def test_question_serializer_with_choices_create(self):
+        data = {
+            'topic_id': self.topic2.id,
+            'text': 'A new question for topic 2?',
+            'question_type': 'single-choice',
+            'order': 1,
+            'choices': [
+                {'text': 'Choice A', 'is_correct': True, 'order': 1},
+                {'text': 'Choice B', 'is_correct': False, 'order': 2},
+            ]
+        }
+        serializer = QuestionSerializer(data=data)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        question = serializer.save()
+        self.assertEqual(question.text, 'A new question for topic 2?')
+        self.assertEqual(question.choices.count(), 2)
+        self.assertTrue(question.choices.filter(text='Choice A', is_correct=True).exists())
 
-    def test_topic_serializer_user_progress(self):
-        enrollment = UserCourseEnrollment.objects.create(user=self.user, course=self.course)
-        UserTopicAttempt.objects.create(
-            enrollment=enrollment, topic=self.topic1, user=self.user, is_completed=True, score=None
-        )
-        # Pass enrollment in context for efficiency
-        context = {'request': self.request, f'enrollment_course_{self.course.id}': enrollment}
-        serializer = TopicSerializer(self.topic1, context=context)
-        data = serializer.data
-        self.assertIsNotNone(data['user_progress'])
-        self.assertTrue(data['user_progress']['is_completed'])
+    def test_question_serializer_update_choices(self):
+        data = {
+            'text': 'Updated Q1 Text',
+            'choices': [
+                {'text': 'New Correct Choice', 'is_correct': True, 'order': 1},
+                {'text': 'New Incorrect Choice', 'is_correct': False, 'order': 2},
+            ]
+        }
+        serializer = QuestionSerializer(instance=self.question1_t1, data=data, partial=True)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        question = serializer.save()
+        self.assertEqual(question.text, 'Updated Q1 Text')
+        self.assertEqual(question.choices.count(), 2)
+        self.assertTrue(question.choices.filter(text='New Correct Choice', is_correct=True).exists())
+        self.assertFalse(Choice.objects.filter(text="Correct", question=question).exists()) # Old choices deleted
 
 
-class QuizQuestionAnswerSerializersTests(TestCase):
+class EnrollmentSerializerTests(SerializerTestDataMixin, TestCase):
+    def test_enrollment_serializer_create(self):
+        request = self.factory.post('/fake-url/') # Mock request
+        request.user = self.another_student # A student not yet enrolled
+
+        data = {'course_id': self.course.id}
+        serializer = EnrollmentSerializer(data=data, context={'request': request})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        enrollment = serializer.save() # user is set from context
+        self.assertEqual(enrollment.user, self.another_student)
+        self.assertEqual(enrollment.course, self.course)
+        self.assertTrue(CourseProgress.objects.filter(user=self.another_student, course=self.course).exists())
+
+    def test_enrollment_serializer_duplicate_enrollment(self):
+        Enrollment.objects.create(user=self.student_user, course=self.course)
+        request = self.factory.post('/fake-url/')
+        request.user = self.student_user
+
+        data = {'course_id': self.course.id}
+        serializer = EnrollmentSerializer(data=data, context={'request': request})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('non_field_errors', serializer.errors) # Or specific field if validation is on course/user
+        self.assertIn("You are already enrolled in this course.", str(serializer.errors))
+
+
+class CourseReviewSerializerTests(SerializerTestDataMixin, TestCase):
     def setUp(self):
-        self.user = User.objects.create_user(email="quiztest@example.com", password="password")
-        course = Course.objects.create(title="Quiz Course", description_html="...")
-        module = Module.objects.create(course=course, title="Quiz Module", order=1)
-        topic = Topic.objects.create(module=module, title="Main Quiz", order=1, content_type='quiz')
-        self.quiz = Quiz.objects.create(topic=topic)
-        self.question1 = Question.objects.create(quiz=self.quiz, text="Q1", question_type='single_choice', order=1)
-        self.option1_q1 = AnswerOption.objects.create(question=self.question1, text="Opt A (Correct)", is_correct=True)
-        self.option2_q1 = AnswerOption.objects.create(question=self.question1, text="Opt B", is_correct=False)
+        super().setUpTestData()
+        # Student needs to be enrolled to review
+        self.enrollment = Enrollment.objects.create(user=self.student_user, course=self.course)
+
+    def test_course_review_create_valid(self):
+        request = self.factory.post('/fake-url/')
+        request.user = self.student_user
+
+        data = {
+            'course_id': self.course.id, # write_only
+            'rating': 5,
+            'comment': 'Loved this course!'
+        }
+        # user_id is also write_only, but we'll rely on context for user
+        serializer = CourseReviewSerializer(data=data, context={'request': request})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        review = serializer.save() # user is set from context
+        self.assertEqual(review.user, self.student_user)
+        self.assertEqual(review.course, self.course)
+        self.assertEqual(review.rating, 5)
+
+    def test_course_review_create_not_enrolled_fails(self):
+        request = self.factory.post('/fake-url/')
+        request.user = self.another_student # This student is not enrolled
+
+        data = {'course_id': self.course.id, 'rating': 4}
+        serializer = CourseReviewSerializer(data=data, context={'request': request})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('non_field_errors', serializer.errors)
+        self.assertIn("You must be enrolled in this course to submit a review.", str(serializer.errors))
+
+    def test_course_review_create_duplicate_review_fails(self):
+        CourseReview.objects.create(user=self.student_user, course=self.course, rating=3)
+        request = self.factory.post('/fake-url/')
+        request.user = self.student_user
+
+        data = {'course_id': self.course.id, 'rating': 5}
+        serializer = CourseReviewSerializer(data=data, context={'request': request})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('non_field_errors', serializer.errors)
+        self.assertIn("You have already reviewed this course.", str(serializer.errors))
+
+
+class QuizSubmissionSerializerTests(SerializerTestDataMixin, TestCase):
+    def setUp(self):
+        super().setUpTestData()
+        self.enrollment = Enrollment.objects.create(user=self.student_user, course=self.course)
+        # CourseProgress should be created by enrollment signal
+        self.course_progress = CourseProgress.objects.get(user=self.student_user, course=self.course)
+
+    def test_quiz_submission_valid(self):
+        request = self.factory.post('/fake-url/')
+        request.user = self.student_user
+
+        data = {
+            'topic_id': self.topic1.id,
+            'answers': [
+                {'question_id': self.question1_t1.id, 'selected_choice_ids': [self.choice1_q1.id]}, # Correct
+                {'question_id': self.question2_t1.id, 'selected_choice_ids': [self.choice1_q2.id, self.choice3_q2.id]} # Incorrect (c3 is wrong)
+            ]
+        }
+        serializer = QuizSubmissionSerializer(data=data, context={'request': request})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        quiz_attempt = serializer.save() # user is set from context
+
+        self.assertEqual(quiz_attempt.user, self.student_user)
+        self.assertEqual(quiz_attempt.topic, self.topic1)
+        self.assertEqual(quiz_attempt.correct_answers, 1) # Only Q1 was fully correct
+        self.assertEqual(quiz_attempt.total_questions_in_topic, 2)
+        self.assertAlmostEqual(quiz_attempt.score, 50.0)
+        self.assertIsNotNone(quiz_attempt.topic_progress)
+
+        # Check that TopicProgress was updated (or created if it wasn't)
+        topic_progress = TopicProgress.objects.get(user=self.student_user, topic=self.topic1)
+        self.assertIsNotNone(topic_progress)
+        # Depending on QUIZ_PASS_THRESHOLD, topic_progress.is_completed might change.
+        # The serializer's create method doesn't currently set is_completed based on score.
+
+    def test_quiz_submission_invalid_topic_id(self):
+        request = self.factory.post('/fake-url/')
+        request.user = self.student_user
+        invalid_uuid = '123e4567-e89b-12d3-a456-426614174000'
+        data = {'topic_id': invalid_uuid, 'answers': []}
+        serializer = QuizSubmissionSerializer(data=data, context={'request': request})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('topic_id', serializer.errors)
+
+    def test_quiz_submission_not_enrolled(self):
+        request = self.factory.post('/fake-url/')
+        request.user = self.another_student # Not enrolled in self.course
+
+        data = {
+            'topic_id': self.topic1.id,
+            'answers': [{'question_id': self.question1_t1.id, 'selected_choice_ids': [self.choice1_q1.id]}]
+        }
+        serializer = QuizSubmissionSerializer(data=data, context={'request': request})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('topic_id', serializer.errors) # Validation is on topic_id field
+        self.assertIn("You must be enrolled in the course to submit this quiz.", str(serializer.errors['topic_id']))
+
+    def test_quiz_submission_answer_for_wrong_topic_question(self):
+        request = self.factory.post('/fake-url/')
+        request.user = self.student_user
         
-        self.factory = APIRequestFactory()
-        self.request = self.factory.get('/') # Generic request
-        self.request.user = self.user
+        # Create a question belonging to another topic
+        other_topic = Topic.objects.create(module=self.module, title="Other Topic", slug="other-topic", order=3, content={})
+        other_question = Question.objects.create(topic=other_topic, text="Other Q", order=1)
 
-
-    def test_answer_option_serializer_author_view(self):
-        """Test AnswerOptionSerializer shows is_correct for authoring/review."""
-        serializer = AnswerOptionSerializer(self.option1_q1)
-        self.assertTrue(serializer.data['is_correct'])
-        serializer_false = AnswerOptionSerializer(self.option2_q1)
-        self.assertFalse(serializer_false.data['is_correct'])
-
-    def test_answer_option_student_view_serializer(self):
-        """Test AnswerOptionStudentViewSerializer hides is_correct."""
-        serializer = AnswerOptionStudentViewSerializer(self.option1_q1)
-        self.assertNotIn('is_correct', serializer.data)
-        self.assertEqual(serializer.data['text'], self.option1_q1.text)
-
-    def test_question_serializer_author_view(self):
-        """Test QuestionSerializer shows correct options for author/review context."""
-        context = {'request': self.request, 'student_view': False} # Author context
-        serializer = QuestionSerializer(self.question1, context=context)
-        data = serializer.data
-        self.assertEqual(len(data['options']), 2)
-        self.assertTrue(data['options'][0]['is_correct']) # Assuming option1_q1 is first
-        self.assertIn('explanation', data) # Explanation should be available
-
-    def test_question_serializer_student_view(self):
-        """Test QuestionSerializer hides sensitive option data for student quiz-taking context."""
-        context = {'request': self.request, 'student_view': True} # Student context
-        serializer = QuestionSerializer(self.question1, context=context)
-        data = serializer.data
-        self.assertEqual(len(data['options']), 2)
-        self.assertNotIn('is_correct', data['options'][0]) # is_correct should be hidden
-        # Explanation is typically read-only, so its presence depends on model, not student_view for options.
-        # If explanation should also be hidden during quiz taking, serializer needs more logic.
-
-    def test_quiz_serializer_output(self):
-        context = {'request': self.request, 'student_view': False}
-        serializer = QuizSerializer(self.quiz, context=context)
-        data = serializer.data
-        self.assertEqual(data['title'], f"Quiz for: {self.quiz.topic.title}")
-        self.assertEqual(len(data['questions']), 1)
-        self.assertEqual(data['questions'][0]['text'], self.question1.text)
-
-
-class UserInteractionSerializersTests(TestCase):
-    def setUp(self):
-        self.user1 = User.objects.create_user(email="student1@example.com", password="password", full_name="Student One")
-        self.user2 = User.objects.create_user(email="student2@example.com", password="password", full_name="Student Two")
-        self.course = Course.objects.create(title="Interaction Course", description_html="...")
-        self.topic = Topic.objects.create(module=Module.objects.create(course=self.course, title="IM"), title="IT", order=1)
-        self.enrollment1 = UserCourseEnrollment.objects.create(user=self.user1, course=self.course)
-
-        self.factory = APIRequestFactory()
-        self.request = self.factory.get('/')
-        self.request.user = self.user1
-
-    def test_review_serializer_valid_data(self):
-        review_data = {"rating": 5, "comment": "Excellent course!"}
-        # Course and user are typically set by the view context, not in serializer data for creation
-        serializer = ReviewSerializer(data=review_data, context={'request': self.request})
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-        # review = serializer.save(user=self.user1, course=self.course) # Simulate view saving
-        # self.assertEqual(review.rating, 5)
-
-    def test_review_serializer_invalid_rating(self):
-        review_data = {"rating": 6, "comment": "Too good!"}
-        serializer = ReviewSerializer(data=review_data, context={'request': self.request})
+        data = {
+            'topic_id': self.topic1.id,
+            'answers': [
+                {'question_id': other_question.id, 'selected_choice_ids': []} 
+            ]
+        }
+        serializer = QuizSubmissionSerializer(data=data, context={'request': request})
         self.assertFalse(serializer.is_valid())
-        self.assertIn("rating", serializer.errors)
+        self.assertIn('answers', serializer.errors)
+        self.assertIn("One or more submitted question IDs do not belong to this topic.", str(serializer.errors['answers']))
 
-    def test_review_serializer_output(self):
-        review = Review.objects.create(user=self.user1, course=self.course, rating=4, comment="Good")
-        serializer = ReviewSerializer(review, context={'request': self.request})
-        data = serializer.data
-        self.assertEqual(data['rating'], 4)
-        self.assertEqual(data['user']['full_name'], self.user1.full_name)
-
-    def test_user_course_enrollment_serializer_output(self):
-        self.enrollment1.last_accessed_topic = self.topic
-        self.enrollment1.save()
-        serializer = UserCourseEnrollmentSerializer(self.enrollment1, context={'request': self.request})
-        data = serializer.data
-        self.assertEqual(data['user']['full_name'], self.user1.full_name)
-        self.assertEqual(data['course']['title'], self.course.title)
-        self.assertEqual(data['last_accessed_topic']['title'], self.topic.title)
-
-    def test_user_topic_attempt_serializer_output(self):
-        attempt = UserTopicAttempt.objects.create(
-            enrollment=self.enrollment1, topic=self.topic, user=self.user1,
-            is_completed=True, score=80.0, passed=True
-        )
-        serializer = UserTopicAttemptSerializer(attempt, context={'request': self.request})
-        data = serializer.data
-        self.assertTrue(data['is_completed'])
-        self.assertEqual(data['score'], 80.0)
-        self.assertEqual(data['topic']['title'], self.topic.title)
-
-
-class QuizSubmissionSerializersTests(TestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(email="quizsubmit@example.com", password="password")
-        course = Course.objects.create(title="Submission Course", description_html="...")
-        module = Module.objects.create(course=course, title="SM", order=1)
-        self.topic_quiz = Topic.objects.create(module=module, title="Submission Quiz", order=1, content_type='quiz')
-        quiz = Quiz.objects.create(topic=self.topic_quiz)
-        self.question1 = Question.objects.create(quiz=quiz, text="Q1 SC", question_type='single_choice', order=1)
-        self.q1_opt1 = AnswerOption.objects.create(question=self.question1, text="Q1OptA", is_correct=True)
-        self.q1_opt2 = AnswerOption.objects.create(question=self.question1, text="Q1OptB", is_correct=False)
-        self.question2 = Question.objects.create(quiz=quiz, text="Q2 SA", question_type='short_answer', order=2)
-        AnswerOption.objects.create(question=self.question2, text="Correct Short Answer", is_correct=True) # For validation
-
-    def test_submit_answer_serializer_valid_choice(self):
-        data = {"question_id": str(self.question1.id), "answer_option_ids": [str(self.q1_opt1.id)]}
-        serializer = SubmitAnswerSerializer(data=data)
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-
-    def test_submit_answer_serializer_valid_short_answer(self):
-        data = {"question_id": str(self.question2.id), "text_answer": "My short answer."}
-        serializer = SubmitAnswerSerializer(data=data)
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-
-    def test_submit_answer_serializer_missing_options_for_choice(self):
-        data = {"question_id": str(self.question1.id)} # Missing answer_option_ids
-        serializer = SubmitAnswerSerializer(data=data)
-        self.assertFalse(serializer.is_valid())
-        self.assertIn("answer_option_ids", serializer.errors)
-
-    def test_submit_answer_serializer_missing_text_for_short_answer(self):
-        data = {"question_id": str(self.question2.id)} # Missing text_answer
-        serializer = SubmitAnswerSerializer(data=data)
-        self.assertFalse(serializer.is_valid())
-        self.assertIn("text_answer", serializer.errors)
+    def test_quiz_submission_choice_for_wrong_question(self):
+        request = self.factory.post('/fake-url/')
+        request.user = self.student_user
         
-    def test_submit_answer_serializer_invalid_question_id(self):
-        invalid_uuid = uuid.uuid4()
-        data = {"question_id": str(invalid_uuid), "text_answer": "Answer"}
-        serializer = SubmitAnswerSerializer(data=data)
+        data = {
+            'topic_id': self.topic1.id,
+            'answers': [
+                {'question_id': self.question1_t1.id, 'selected_choice_ids': [self.choice1_q2.id]} # choice1_q2 belongs to question2_t1
+            ]
+        }
+        serializer = QuizSubmissionSerializer(data=data, context={'request': request})
         self.assertFalse(serializer.is_valid())
-        self.assertIn("question_id", serializer.errors)
+        self.assertIn('answers', serializer.errors)
+        self.assertIn("Choice does not belong to the specified question.", str(serializer.errors['answers']))
 
-
-    def test_quiz_submission_serializer_valid_data(self):
-        answers_data = [
-            {"question_id": str(self.question1.id), "answer_option_ids": [str(self.q1_opt2.id)]},
-            {"question_id": str(self.question2.id), "text_answer": "Some text"}
-        ]
-        # topic_id is usually from URL, not serializer payload for this setup
-        submission_data = {"answers": answers_data}
-        serializer = QuizSubmissionSerializer(data=submission_data)
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-
-    def test_quiz_submission_serializer_empty_answers_list(self):
-        submission_data = {"answers": []} # allow_empty=False on answers field
-        serializer = QuizSubmissionSerializer(data=submission_data)
-        self.assertFalse(serializer.is_valid())
-        self.assertIn("answers", serializer.errors)
+# Add more tests for other serializers:
+# - TopicProgressSerializer
+# - QuizAttemptResultSerializer
+# - etc.
