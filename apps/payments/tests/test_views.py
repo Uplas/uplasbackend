@@ -1,368 +1,430 @@
-from django.urls import reverse
 from django.contrib.auth import get_user_model
+from django.urls import reverse
 from django.utils import timezone
-from django.conf import settings
 from decimal import Decimal
 from unittest.mock import patch, MagicMock # For mocking Stripe API calls
-import json # For webhook payload simulation
 
-from rest_framework.test import APITestCase, APIClient
 from rest_framework import status
+from rest_framework.test import APITestCase
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from ..models import SubscriptionPlan, UserSubscription, Transaction
-# from apps.users.models import UserProfile # Ensure UserProfile is created by signal if needed
+from apps.payments.models import (
+    SubscriptionPlan, UserSubscription, PaymentTransaction
+)
+from apps.payments.serializers import (
+    SubscriptionPlanSerializer, UserSubscriptionSerializer, PaymentTransactionSerializer
+)
+from django.conf import settings # For Stripe keys and webhook secret
 
 User = get_user_model()
 
-# Dummy Stripe IDs for mocking
-MOCK_STRIPE_CUSTOMER_ID = "cus_mockcustomer123"
-MOCK_STRIPE_SUBSCRIPTION_ID = "sub_mocksubscription123"
-MOCK_STRIPE_CHECKOUT_SESSION_ID = "cs_test_mocksession123"
-MOCK_STRIPE_PAYMENT_INTENT_ID = "pi_mockpaymentintent123"
-MOCK_STRIPE_INVOICE_ID = "in_mockinvoice123"
-MOCK_STRIPE_CHARGE_ID = "ch_mockcharge123"
-
-
-class SubscriptionPlanViewSetTests(APITestCase):
-    def setUp(self):
-        self.plan1 = SubscriptionPlan.objects.create(name="Basic", price=Decimal("9.99"), is_active=True, stripe_price_id="price_basic")
-        self.plan2 = SubscriptionPlan.objects.create(name="Premium", price=Decimal("19.99"), is_active=True, stripe_price_id="price_premium")
-        SubscriptionPlan.objects.create(name="Inactive", price=Decimal("5.00"), is_active=False, stripe_price_id="price_inactive")
-        self.list_url = reverse('payments:subscriptionplan-list')
-
-    def test_list_subscription_plans(self):
-        response = self.client.get(self.list_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data['results']), 2) # Only active plans
-        plan_names = {item['name'] for item in response.data['results']}
-        self.assertIn(self.plan1.name, plan_names)
-        self.assertIn(self.plan2.name, plan_names)
-
-
-class UserSubscriptionViewSetTests(APITestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(email="subview@example.com", password="password", stripe_customer_id=MOCK_STRIPE_CUSTOMER_ID)
-        self.plan = SubscriptionPlan.objects.create(name="Active Plan", price=Decimal("10.00"), stripe_price_id="price_active_subview")
-        self.my_subscription_url = reverse('payments:my-usersubscription-list') # For GET (list action acts as retrieve)
-        self.cancel_action_url = reverse('payments:my-usersubscription-cancel-my-subscription') # For POST to custom action
-
-        self.client = APIClient()
-        self.client.force_authenticate(user=self.user)
-
-    def test_get_my_subscription_exists(self):
-        UserSubscription.objects.create(
-            user=self.user, plan=self.plan, status='active', stripe_subscription_id="sub_test_exists"
+# Test Data Setup Mixin (adapted for APITestCase)
+class PaymentsViewTestDataMixin:
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin_user = User.objects.create_superuser(
+            username='payview_admin', email='payview_admin@example.com', password='password123',
+            full_name='PayView Admin'
         )
-        response = self.client.get(self.my_subscription_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data['plan']['name'], self.plan.name)
-        self.assertEqual(response.data['status'], 'active')
+        cls.user1 = User.objects.create_user(
+            username='payview_user1', email='payview_user1@example.com', password='password123',
+            full_name='PayView User One'
+        )
+        # It's good practice to have a UserProfile if your User model expects one for stripe_customer_id
+        # For simplicity, we'll assume stripe_customer_id can be directly on User or handled in view.
+        # If UserProfile is used:
+        # from apps.users.models import UserProfile # Assuming you have this
+        # UserProfile.objects.create(user=cls.user1, stripe_customer_id='cus_test_payview_user1')
 
-    def test_get_my_subscription_not_exists(self):
-        response = self.client.get(self.my_subscription_url)
+
+        cls.user2_no_sub = User.objects.create_user(
+            username='payview_user2', email='payview_user2@example.com', password='password123',
+            full_name='PayView User Two'
+        )
+
+        cls.plan_monthly_active = SubscriptionPlan.objects.create(
+            name='Active Monthly Plan',
+            stripe_price_id='price_active_monthly_pv',
+            price=Decimal('29.99'),
+            currency='USD',
+            billing_cycle='monthly',
+            is_active=True,
+            display_order=1
+        )
+        cls.plan_annual_active = SubscriptionPlan.objects.create(
+            name='Active Annual Plan',
+            stripe_price_id='price_active_annual_pv',
+            price=Decimal('299.00'),
+            currency='USD',
+            billing_cycle='annually',
+            is_active=True,
+            display_order=0
+        )
+        cls.plan_monthly_inactive = SubscriptionPlan.objects.create(
+            name='Inactive Monthly Plan',
+            stripe_price_id='price_inactive_monthly_pv',
+            price=Decimal('15.00'),
+            currency='USD',
+            billing_cycle='monthly',
+            is_active=False # Inactive
+        )
+
+        cls.user1_subscription = UserSubscription.objects.create(
+            user=cls.user1,
+            plan=cls.plan_monthly_active,
+            stripe_subscription_id='sub_payview_user1_active',
+            stripe_customer_id='cus_payview_user1', # Make sure this customer ID exists in Stripe for real tests, or mock it
+            status='active',
+            current_period_start=timezone.now() - timezone.timedelta(days=15),
+            current_period_end=timezone.now() + timezone.timedelta(days=15)
+        )
+
+    def get_jwt_tokens_for_user(self, user):
+        refresh = RefreshToken.for_user(user)
+        return {'refresh': str(refresh), 'access': str(refresh.access_token)}
+
+    def authenticate_client_with_jwt(self, user):
+        tokens = self.get_jwt_tokens_for_user(user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {tokens["access"]}')
+
+
+class SubscriptionPlanViewSetTests(PaymentsViewTestDataMixin, APITestCase):
+    def test_list_active_subscription_plans_anonymous(self):
+        url = reverse('payments:subscription-plan-list')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Only active plans should be listed (plan_monthly_active, plan_annual_active)
+        self.assertEqual(len(response.data['results']), 2)
+        plan_names_in_response = [plan['name'] for plan in response.data['results']]
+        self.assertIn(self.plan_monthly_active.name, plan_names_in_response)
+        self.assertIn(self.plan_annual_active.name, plan_names_in_response)
+        self.assertNotIn(self.plan_monthly_inactive.name, plan_names_in_response)
+
+    def test_retrieve_active_subscription_plan_anonymous(self):
+        url = reverse('payments:subscription-plan-detail', kwargs={'pk': self.plan_monthly_active.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['name'], self.plan_monthly_active.name)
+
+    def test_retrieve_inactive_subscription_plan_anonymous_not_found(self):
+        # ViewSet queryset filters for is_active=True
+        url = reverse('payments:subscription-plan-detail', kwargs={'pk': self.plan_monthly_inactive.pk})
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    @patch('stripe.Subscription.modify')
-    def test_cancel_my_stripe_subscription_success(self, mock_stripe_sub_modify):
-        """Test canceling an active Stripe-managed subscription."""
-        mock_stripe_sub_modify.return_value = MagicMock(id=MOCK_STRIPE_SUBSCRIPTION_ID, cancel_at_period_end=True)
-        user_sub = UserSubscription.objects.create(
-            user=self.user, plan=self.plan, status='active', stripe_subscription_id=MOCK_STRIPE_SUBSCRIPTION_ID
-        )
-        response = self.client.post(self.cancel_action_url) # POST to the custom action
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertIn("cancel at the end of the current billing period", response.data['detail'])
-        user_sub.refresh_from_db()
-        self.assertTrue(user_sub.cancel_at_period_end)
-        mock_stripe_sub_modify.assert_called_once_with(MOCK_STRIPE_SUBSCRIPTION_ID, cancel_at_period_end=True)
-
-    def test_cancel_my_internal_subscription_success(self):
-        """Test canceling an internal (non-Stripe) subscription."""
-        user_sub = UserSubscription.objects.create(user=self.user, plan=self.plan, status='active', stripe_subscription_id=None) # No Stripe ID
-        response = self.client.post(self.cancel_action_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertEqual(response.data['detail'], 'Subscription marked as canceled internally.')
-        user_sub.refresh_from_db()
-        self.assertEqual(user_sub.status, 'canceled')
-        self.assertIsNotNone(user_sub.canceled_at)
-        self.assertIsNotNone(user_sub.ended_at)
+    # Admin-only actions (create, update, delete) for plans are typically via Django Admin.
+    # If API endpoints for these are added to the ViewSet, they'd need IsAdminUser permission
+    # and corresponding tests. For a ReadOnlyModelViewSet, these are not applicable.
 
 
-    def test_cancel_my_subscription_no_active_sub(self):
-        response = self.client.post(self.cancel_action_url)
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-
-    @patch('stripe.Subscription.modify')
-    def test_cancel_my_stripe_subscription_stripe_error(self, mock_stripe_sub_modify):
-        mock_stripe_sub_modify.side_effect = stripe.error.StripeError("Stripe API unavailable")
-        UserSubscription.objects.create(
-            user=self.user, plan=self.plan, status='active', stripe_subscription_id=MOCK_STRIPE_SUBSCRIPTION_ID
-        )
-        response = self.client.post(self.cancel_action_url)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("Could not request cancellation", response.data['detail'])
-
-
-class TransactionViewSetTests(APITestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(email="transview@example.com", password="password")
-        self.other_user = User.objects.create_user(email="othertrans@example.com", password="password")
-        Transaction.objects.create(user=self.user, amount=Decimal("10.00"), currency="USD", status="succeeded")
-        Transaction.objects.create(user=self.user, amount=Decimal("5.00"), currency="USD", status="failed")
-        Transaction.objects.create(user=self.other_user, amount=Decimal("20.00"), currency="USD", status="succeeded")
-        
-        self.list_url = reverse('payments:transaction-list')
-        self.client.force_authenticate(user=self.user)
-
-    def test_list_my_transactions(self):
-        response = self.client.get(self.list_url)
+class UserSubscriptionViewSetTests(PaymentsViewTestDataMixin, APITestCase):
+    def test_get_my_subscription_authenticated_user_has_sub(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('payments:user-subscription-my-subscription')
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data['results']), 2) # Only self.user's transactions
+        self.assertEqual(response.data['stripe_subscription_id'], self.user1_subscription.stripe_subscription_id)
+        self.assertEqual(response.data['plan']['id'], str(self.plan_monthly_active.id))
 
-    def test_list_transactions_unauthenticated(self):
-        self.client.logout()
-        response = self.client.get(self.list_url)
+    def test_get_my_subscription_authenticated_user_no_sub(self):
+        self.authenticate_client_with_jwt(self.user2_no_sub)
+        url = reverse('payments:user-subscription-my-subscription')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn('No active subscription found', response.data['detail'])
+
+    def test_get_my_subscription_unauthenticated(self):
+        url = reverse('payments:user-subscription-my-subscription')
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
-
-
-class CreateCheckoutSessionViewTests(APITestCase):
-    def setUp(self):
-        self.user_no_stripe_id = User.objects.create_user(email="checkout_no_id@example.com", password="password", full_name="Checkout User NoSID")
-        self.user_with_stripe_id = User.objects.create_user(email="checkout_with_id@example.com", password="password", full_name="Checkout User SID", stripe_customer_id=MOCK_STRIPE_CUSTOMER_ID)
-        self.plan = SubscriptionPlan.objects.create(name="Checkout Plan", price=Decimal("25.00"), is_active=True, stripe_price_id="price_checkout123")
-        self.url = reverse('payments:create-checkout-session')
-        self.client = APIClient()
-        self.valid_payload = {
-            "plan_id": str(self.plan.id),
-            "success_url": "https://example.com/success",
-            "cancel_url": "https://example.com/cancel"
-        }
 
     @patch('stripe.Customer.create')
-    @patch('stripe.checkout.Session.create')
-    def test_create_checkout_session_new_stripe_customer(self, mock_checkout_session_create, mock_customer_create):
-        """Test session creation when user is new to Stripe."""
-        self.client.force_authenticate(user=self.user_no_stripe_id)
-        mock_customer_create.return_value = MagicMock(id=MOCK_STRIPE_CUSTOMER_ID)
-        mock_checkout_session_create.return_value = MagicMock(id=MOCK_STRIPE_CHECKOUT_SESSION_ID, url="https://stripe.com/checkout/mock_url")
+    @patch('stripe.PaymentMethod.attach')
+    @patch('stripe.Customer.modify')
+    @patch('stripe.Subscription.create')
+    def test_create_subscription_success(
+        self, mock_stripe_sub_create, mock_stripe_customer_modify,
+        mock_stripe_pm_attach, mock_stripe_customer_create
+    ):
+        self.authenticate_client_with_jwt(self.user2_no_sub) # User without a subscription
 
-        response = self.client.post(self.url, self.valid_payload, format='json')
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertIn("checkout_url", response.data)
-        self.assertEqual(response.data["checkout_session_id"], MOCK_STRIPE_CHECKOUT_SESSION_ID)
+        # Mock Stripe API responses
+        mock_stripe_customer_create.return_value = MagicMock(id='cus_new_test_customer')
+        # mock_stripe_pm_attach.return_value = MagicMock() # Attach doesn't return much
+        # mock_stripe_customer_modify.return_value = MagicMock() # Modify doesn't return much
 
-        mock_customer_create.assert_called_once()
-        self.user_no_stripe_id.refresh_from_db()
-        self.assertEqual(self.user_no_stripe_id.stripe_customer_id, MOCK_STRIPE_CUSTOMER_ID)
+        # Simulate a successful subscription creation with a PaymentIntent that succeeded
+        mock_stripe_sub_create.return_value = MagicMock(
+            id='sub_new_test_subscription',
+            status='active', # or 'trialing' or 'incomplete' if payment_intent is requires_action
+            items={'data': [{'price': {'id': self.plan_annual_active.stripe_price_id}}]},
+            current_period_start=int(timezone.now().timestamp()),
+            current_period_end=int((timezone.now() + timezone.timedelta(days=30)).timestamp()),
+            trial_start=None,
+            trial_end=None,
+            latest_invoice=MagicMock(
+                id='in_new_test_invoice',
+                payment_intent=MagicMock(
+                    id='pi_new_test_payment_intent',
+                    status='succeeded',
+                    client_secret=None, # Not needed if succeeded
+                    amount_received=int(self.plan_annual_active.price * 100),
+                    currency=self.plan_annual_active.currency.lower(),
+                    created=int(timezone.now().timestamp())
+                )
+            ),
+            pending_setup_intent=None
+        )
+
+        url = reverse('payments:user-subscription-create-subscription')
+        data = {
+            'plan_id': str(self.plan_annual_active.id),
+            'payment_method_id': 'pm_test_card_visa' # A test payment method ID from Stripe.js
+        }
+        response = self.client.post(url, data, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data['stripe_subscription_id'], 'sub_new_test_subscription')
+        self.assertEqual(response.data['status'], 'active')
         
-        mock_checkout_session_create.assert_called_once_with(
-            customer=MOCK_STRIPE_CUSTOMER_ID,
-            payment_method_types=['card'],
-            line_items=[{'price': self.plan.stripe_price_id, 'quantity': 1}],
-            mode='subscription',
-            success_url=self.valid_payload["success_url"] + '?session_id={CHECKOUT_SESSION_ID}',
-            cancel_url=self.valid_payload["cancel_url"],
-            metadata={'uplas_user_id': str(self.user_no_stripe_id.id), 'uplas_plan_id': str(self.plan.id)}
+        mock_stripe_customer_create.assert_called_once()
+        mock_stripe_sub_create.assert_called_once()
+
+        # Verify UserSubscription and PaymentTransaction created in DB
+        self.assertTrue(UserSubscription.objects.filter(user=self.user2_no_sub, stripe_subscription_id='sub_new_test_subscription').exists())
+        self.assertTrue(PaymentTransaction.objects.filter(user=self.user2_no_sub, stripe_charge_id='pi_new_test_payment_intent', status='succeeded').exists())
+
+    @patch('stripe.Subscription.create')
+    def test_create_subscription_user_already_has_active_sub(self, mock_stripe_sub_create):
+        self.authenticate_client_with_jwt(self.user1) # user1 already has a subscription
+        url = reverse('payments:user-subscription-create-subscription')
+        data = {'plan_id': str(self.plan_annual_active.id), 'payment_method_id': 'pm_another_card'}
+        
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('already have an active subscription', response.data['detail'])
+        mock_stripe_sub_create.assert_not_called()
+
+    @patch('stripe.Subscription.delete')
+    @patch('stripe.Subscription.modify')
+    def test_cancel_subscription_at_period_end(self, mock_stripe_sub_modify, mock_stripe_sub_delete):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('payments:user-subscription-cancel-subscription')
+        data = {'cancel_immediately': False} # Default, or explicitly False
+
+        # Mock Stripe API response for modify
+        mock_stripe_sub_modify.return_value = MagicMock(id=self.user1_subscription.stripe_subscription_id, cancel_at_period_end=True)
+
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIn('Subscription cancellation requested', response.data['detail'])
+        
+        mock_stripe_sub_modify.assert_called_once_with(
+            self.user1_subscription.stripe_subscription_id,
+            cancel_at_period_end=True
         )
-        self.assertTrue(UserSubscription.objects.filter(user=self.user_no_stripe_id, plan=self.plan, status='incomplete').exists())
+        mock_stripe_sub_delete.assert_not_called()
+
+        self.user1_subscription.refresh_from_db()
+        self.assertTrue(self.user1_subscription.cancel_at_period_end)
+        self.assertEqual(self.user1_subscription.status, 'pending_cancellation') # Local status update
+
+    @patch('stripe.Subscription.delete')
+    @patch('stripe.Subscription.modify')
+    def test_cancel_subscription_immediately(self, mock_stripe_sub_modify, mock_stripe_sub_delete):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('payments:user-subscription-cancel-subscription')
+        data = {'cancel_immediately': True}
+
+        # Mock Stripe API response for delete
+        mock_stripe_sub_delete.return_value = MagicMock(id=self.user1_subscription.stripe_subscription_id, status='canceled')
+
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        
+        mock_stripe_sub_delete.assert_called_once_with(self.user1_subscription.stripe_subscription_id)
+        mock_stripe_sub_modify.assert_not_called()
+        # The actual status update to 'cancelled' in DB would typically happen via webhook 'customer.subscription.deleted'
 
 
-    @patch('stripe.checkout.Session.create')
-    def test_create_checkout_session_existing_stripe_customer(self, mock_checkout_session_create):
-        """Test session creation when user already has a Stripe customer ID."""
-        self.client.force_authenticate(user=self.user_with_stripe_id)
-        mock_checkout_session_create.return_value = MagicMock(id=MOCK_STRIPE_CHECKOUT_SESSION_ID, url="https://stripe.com/checkout/mock_url")
+class PaymentTransactionViewSetTests(PaymentsViewTestDataMixin, APITestCase):
+    def setUp(self):
+        super().setUpTestData() # Call mixin's setup
+        self.transaction1_user1 = PaymentTransaction.objects.create(
+            user=self.user1, user_subscription=self.user1_subscription,
+            stripe_charge_id='ch_payview_user1_txn1', amount=Decimal('29.99'), currency='USD',
+            status='succeeded', paid_at=timezone.now()
+        )
+        self.transaction2_user1 = PaymentTransaction.objects.create(
+            user=self.user1, user_subscription=self.user1_subscription,
+            stripe_charge_id='ch_payview_user1_txn2', amount=Decimal('29.99'), currency='USD',
+            status='succeeded', paid_at=timezone.now() - timezone.timedelta(days=30)
+        )
+        # Transaction for another user, should not be visible to user1
+        self.transaction_user2 = PaymentTransaction.objects.create(
+            user=self.user2_no_sub, # No active sub, but could have past transactions
+            stripe_charge_id='ch_payview_user2_txn1', amount=Decimal('10.00'), currency='USD',
+            status='failed', created_at=timezone.now() - timezone.timedelta(days=5)
+        )
 
-        response = self.client.post(self.url, self.valid_payload, format='json')
+    def test_list_my_payment_transactions(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('payments:payment-transaction-list')
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        mock_checkout_session_create.assert_called_once_with(
-            customer=self.user_with_stripe_id.stripe_customer_id, # Existing ID used
-            payment_method_types=['card'],
-            line_items=[{'price': self.plan.stripe_price_id, 'quantity': 1}],
-            mode='subscription',
-            success_url=self.valid_payload["success_url"] + '?session_id={CHECKOUT_SESSION_ID}',
-            cancel_url=self.valid_payload["cancel_url"],
-            metadata={'uplas_user_id': str(self.user_with_stripe_id.id), 'uplas_plan_id': str(self.plan.id)}
-        )
-        self.assertTrue(UserSubscription.objects.filter(user=self.user_with_stripe_id, plan=self.plan, status='incomplete').exists())
+        self.assertEqual(len(response.data['results']), 2) # Only user1's transactions
+        charge_ids_in_response = [item['stripe_charge_id'] for item in response.data['results']]
+        self.assertIn(self.transaction1_user1.stripe_charge_id, charge_ids_in_response)
+        self.assertIn(self.transaction2_user1.stripe_charge_id, charge_ids_in_response)
+        self.assertNotIn(self.transaction_user2.stripe_charge_id, charge_ids_in_response)
 
+    def test_retrieve_my_payment_transaction(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('payments:payment-transaction-detail', kwargs={'pk': self.transaction1_user1.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['stripe_charge_id'], self.transaction1_user1.stripe_charge_id)
 
-    def test_create_checkout_session_unauthenticated(self):
-        response = self.client.post(self.url, self.valid_payload, format='json')
+    def test_retrieve_other_user_payment_transaction_not_found(self):
+        self.authenticate_client_with_jwt(self.user1)
+        url = reverse('payments:payment-transaction-detail', kwargs={'pk': self.transaction_user2.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND) # Due to queryset filtering
+
+    def test_list_transactions_unauthenticated(self):
+        url = reverse('payments:payment-transaction-list')
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    def test_create_checkout_session_invalid_plan_id(self):
-        self.client.force_authenticate(user=self.user_no_stripe_id)
-        payload = self.valid_payload.copy()
-        payload["plan_id"] = str(uuid.uuid4()) # Non-existent plan
-        response = self.client.post(self.url, payload, format='json')
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST) # Serializer validation
 
-
-class StripeWebhookViewTests(APITestCase):
-    def setUp(self):
-        self.webhook_url = reverse('payments:stripe-webhook')
-        self.user = User.objects.create_user(email="webhookuser@example.com", password="password", stripe_customer_id=MOCK_STRIPE_CUSTOMER_ID)
-        self.plan = SubscriptionPlan.objects.create(name="Webhook Plan", price=Decimal("30.00"), stripe_price_id="price_webhook_plan")
-        
-        # Mock settings value for webhook secret
-        self.original_webhook_secret = getattr(settings, 'STRIPE_WEBHOOK_SECRET_PAYMENTS', None)
-        settings.STRIPE_WEBHOOK_SECRET_PAYMENTS = "whsec_test_mocksecretfordjangotests"
-        # Also need to re-assign in view's module scope if it's loaded at import time
-        # This is tricky. For robust testing of webhooks, stripe-mock is better.
-        # For now, we rely on mocking construct_event.
-
-    def tearDown(self):
-        # Restore original webhook secret
-        settings.STRIPE_WEBHOOK_SECRET_PAYMENTS = self.original_webhook_secret
-
-
-    @patch('stripe.Webhook.construct_event')
-    def test_webhook_checkout_session_completed_paid(self, mock_construct_event):
-        """Test handler for checkout.session.completed with payment_status='paid'."""
-        event_payload = {
-            "id": "evt_mock_checkout_completed",
-            "type": "checkout.session.completed",
-            "data": {
-                "object": {
-                    "id": MOCK_STRIPE_CHECKOUT_SESSION_ID,
-                    "customer": MOCK_STRIPE_CUSTOMER_ID,
-                    "subscription": MOCK_STRIPE_SUBSCRIPTION_ID,
-                    "payment_status": "paid",
-                    "metadata": {
-                        "uplas_user_id": str(self.user.id),
-                        "uplas_plan_id": str(self.plan.id)
-                    }
-                }
-            }
-        }
-        mock_construct_event.return_value = event_payload # Return the dict itself, StripeObject is complex to mock fully
-
-        # Simulate a preliminary incomplete subscription from CreateCheckoutSessionView
-        UserSubscription.objects.create(user=self.user, plan=self.plan, status='incomplete', stripe_customer_id=MOCK_STRIPE_CUSTOMER_ID)
-
-        response = self.client.post(
-            self.webhook_url, 
-            data=json.dumps(event_payload), # Send as raw JSON string
-            content_type='application/json',
-            HTTP_STRIPE_SIGNATURE="t=123,v1=mockedsig" # Mocked signature
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        
-        user_sub = UserSubscription.objects.get(user=self.user)
-        # The status 'active' and period dates are typically set by customer.subscription.created/updated.
-        # checkout.session.completed confirms payment and links sub_id.
-        self.assertEqual(user_sub.stripe_subscription_id, MOCK_STRIPE_SUBSCRIPTION_ID)
-        # self.assertEqual(user_sub.status, 'active') # This might not be set by checkout.session.completed alone
-
-    @patch('stripe.Webhook.construct_event')
-    def test_webhook_customer_subscription_created(self, mock_construct_event):
-        """Test handler for customer.subscription.created."""
-        stripe_sub_payload = {
-            "id": MOCK_STRIPE_SUBSCRIPTION_ID,
-            "customer": MOCK_STRIPE_CUSTOMER_ID,
-            "status": "active",
-            "current_period_start": int(timezone.now().timestamp()),
-            "current_period_end": int((timezone.now() + timezone.timedelta(days=30)).timestamp()),
-            "start_date": int(timezone.now().timestamp()),
-            "items": {"data": [{"price": {"id": self.plan.stripe_price_id}}]},
-            "cancel_at_period_end": False,
-        }
-        event_payload = {"id": "evt_mock_sub_created", "type": "customer.subscription.created", "data": {"object": stripe_sub_payload}}
-        mock_construct_event.return_value = event_payload
-
-        response = self.client.post(self.webhook_url, data=json.dumps(event_payload), content_type='application/json', HTTP_STRIPE_SIGNATURE="t=123,v1=mock")
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-
-        user_sub = UserSubscription.objects.get(user=self.user, stripe_subscription_id=MOCK_STRIPE_SUBSCRIPTION_ID)
-        self.assertEqual(user_sub.status, "active")
-        self.assertEqual(user_sub.plan, self.plan)
-        self.assertIsNotNone(user_sub.current_period_end)
-        self.user.refresh_from_db()
-        self.assertTrue(self.user.is_premium_subscriber)
-        self.assertEqual(self.user.subscription_plan_name, self.plan.name)
-
-
-    @patch('stripe.Webhook.construct_event')
-    def test_webhook_customer_subscription_deleted_canceled(self, mock_construct_event):
-        """Test handler for customer.subscription.deleted (canceled)."""
-        UserSubscription.objects.create(
-            user=self.user, plan=self.plan, status='active', 
-            stripe_subscription_id=MOCK_STRIPE_SUBSCRIPTION_ID,
-            current_period_end=timezone.now() + timezone.timedelta(days=5) # Still active initially
-        )
-        self.user.is_premium_subscriber = True # Simulate active state
-        self.user.save()
-
-        canceled_at_ts = int(timezone.now().timestamp())
-        stripe_sub_payload = {
-            "id": MOCK_STRIPE_SUBSCRIPTION_ID,
-            "customer": MOCK_STRIPE_CUSTOMER_ID,
-            "status": "canceled", # Stripe sends 'canceled' status
-            "current_period_start": int((timezone.now() - timezone.timedelta(days=25)).timestamp()),
-            "current_period_end": int(timezone.now().timestamp()), # Period effectively ends now
-            "canceled_at": canceled_at_ts,
-            "items": {"data": [{"price": {"id": self.plan.stripe_price_id}}]},
-            "cancel_at_period_end": False, # It's fully canceled now
-        }
-        event_payload = {"id": "evt_mock_sub_deleted", "type": "customer.subscription.deleted", "data": {"object": stripe_sub_payload}}
-        mock_construct_event.return_value = event_payload
-
-        response = self.client.post(self.webhook_url, data=json.dumps(event_payload), content_type='application/json', HTTP_STRIPE_SIGNATURE="t=123,v1=mock")
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-
-        user_sub = UserSubscription.objects.get(user=self.user, stripe_subscription_id=MOCK_STRIPE_SUBSCRIPTION_ID)
-        self.assertEqual(user_sub.status, "canceled")
-        self.assertEqual(user_sub.canceled_at, datetime.fromtimestamp(canceled_at_ts, tz=timezone.utc))
-        self.user.refresh_from_db()
-        self.assertFalse(self.user.is_premium_subscriber)
+class StripeWebhookViewTests(PaymentsViewTestDataMixin, APITestCase):
+    # These tests are more complex as they involve mocking Stripe's event construction
+    # and verifying the side effects (database changes).
 
     @patch('stripe.Webhook.construct_event')
     def test_webhook_invoice_payment_succeeded(self, mock_construct_event):
-        """Test handler for invoice.payment_succeeded."""
-        UserSubscription.objects.create( # Ensure subscription exists for renewal invoice
-            user=self.user, plan=self.plan, status='active', stripe_subscription_id=MOCK_STRIPE_SUBSCRIPTION_ID
-        )
-        invoice_payload = {
-            "id": MOCK_STRIPE_INVOICE_ID,
-            "customer": MOCK_STRIPE_CUSTOMER_ID,
-            "subscription": MOCK_STRIPE_SUBSCRIPTION_ID,
-            "payment_intent": MOCK_STRIPE_PAYMENT_INTENT_ID,
-            "charge": MOCK_STRIPE_CHARGE_ID,
-            "amount_paid": 3000, # Cents
-            "currency": "usd",
-            "billing_reason": "subscription_cycle", # For renewal
-            "status_transitions": {"paid_at": int(timezone.now().timestamp())}
-        }
-        event_payload = {"id": "evt_mock_invoice_paid", "type": "invoice.payment_succeeded", "data": {"object": invoice_payload}}
-        mock_construct_event.return_value = event_payload
+        # Prepare a mock Stripe Event object
+        stripe_sub_id = self.user1_subscription.stripe_subscription_id
+        stripe_customer_id = self.user1_subscription.stripe_customer_id
+        invoice_id = 'in_test_webhook_invoice'
+        payment_intent_id = 'pi_test_webhook_pi'
+        amount_paid = int(self.user1_subscription.plan.price * 100)
+        currency = self.user1_subscription.plan.currency.lower()
+        period_start_ts = int((self.user1_subscription.current_period_end + timezone.timedelta(seconds=1)).timestamp())
+        period_end_ts = int((self.user1_subscription.current_period_end + timezone.timedelta(days=30)).timestamp())
+        paid_at_ts = period_start_ts # Simulate payment at start of new period
 
-        response = self.client.post(self.webhook_url, data=json.dumps(event_payload), content_type='application/json', HTTP_STRIPE_SIGNATURE="t=123,v1=mock")
+        mock_event_data = {
+            'id': 'evt_test_webhook_event',
+            'type': 'invoice.payment_succeeded',
+            'data': {
+                'object': {
+                    'id': invoice_id,
+                    'object': 'invoice',
+                    'customer': stripe_customer_id,
+                    'subscription': stripe_sub_id,
+                    'payment_intent': payment_intent_id,
+                    'charge': 'ch_dummy_charge_for_pi', # Can be same as PI or a related charge
+                    'amount_paid': amount_paid,
+                    'amount_due': amount_paid, # For succeeded
+                    'currency': currency,
+                    'period_start': period_start_ts,
+                    'period_end': period_end_ts,
+                    'status_transitions': {'paid_at': paid_at_ts},
+                    'payment_settings': {'payment_method_types': ['card']},
+                    'number': 'INV-123-WEBHOOK'
+                }
+            }
+        }
+        mock_construct_event.return_value = mock_event_data # Stripe library usually returns an Event object, here simplified to dict
+
+        url = reverse('payments:stripe-webhook')
+        # Stripe sends a signature, which we are mocking the verification of.
+        # The actual signature depends on the payload and your webhook secret.
+        # For testing, we bypass the actual signature check by mocking construct_event.
+        response = self.client.post(
+            url,
+            data=mock_event_data, # This is a simplification, actual payload is raw body
+            content_type='application/json',
+            HTTP_STRIPE_SIGNATURE='whsec_test_signature_is_mocked' # Dummy signature
+        )
+
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        
-        self.assertTrue(Transaction.objects.filter(
-            user=self.user, 
-            stripe_invoice_id=MOCK_STRIPE_INVOICE_ID,
-            stripe_payment_intent_id=MOCK_STRIPE_PAYMENT_INTENT_ID,
-            status='succeeded',
-            amount=Decimal("30.00")
+        mock_construct_event.assert_called_once() # Ensure our mock was used
+
+        # Verify database changes
+        self.user1_subscription.refresh_from_db()
+        self.assertEqual(self.user1_subscription.status, 'active')
+        self.assertEqual(int(self.user1_subscription.current_period_start.timestamp()), period_start_ts)
+        self.assertEqual(int(self.user1_subscription.current_period_end.timestamp()), period_end_ts)
+
+        self.assertTrue(PaymentTransaction.objects.filter(
+            user=self.user1,
+            stripe_charge_id=payment_intent_id, # or invoice.charge
+            stripe_invoice_id=invoice_id,
+            status='succeeded'
         ).exists())
 
-    def test_webhook_invalid_signature(self):
-        """Test webhook view returns 400 for invalid signature if construct_event is not mocked to succeed."""
-        # This test relies on Stripe SDK raising SignatureVerificationError if secret is wrong
-        # For a more direct test, mock construct_event to raise it.
-        with patch('stripe.Webhook.construct_event', side_effect=stripe.error.SignatureVerificationError("Bad sig", "sig_header")):
-            response = self.client.post(
-                self.webhook_url,
-                data=json.dumps({"id": "evt_test", "type": "test.event"}),
-                content_type='application/json',
-                HTTP_STRIPE_SIGNATURE="t=123,v1=badsignature"
-            )
-            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-            self.assertIn("Invalid signature", response.data['error'])
+    @patch('stripe.Webhook.construct_event')
+    def test_webhook_customer_subscription_deleted(self, mock_construct_event):
+        stripe_sub_id = self.user1_subscription.stripe_subscription_id
+        canceled_at_ts = int(timezone.now().timestamp())
 
-    # More webhook tests:
-    # - invoice.payment_failed
-    # - Different subscription statuses (trialing, past_due, unpaid)
-    # - Idempotency (processing same event ID twice) - requires more setup
+        mock_event_data = {
+            'id': 'evt_test_sub_deleted_event',
+            'type': 'customer.subscription.deleted',
+            'data': {
+                'object': {
+                    'id': stripe_sub_id,
+                    'object': 'subscription',
+                    'status': 'canceled', # Stripe sends 'canceled' on delete
+                    'customer': self.user1_subscription.stripe_customer_id,
+                    'current_period_start': int(self.user1_subscription.current_period_start.timestamp()),
+                    'current_period_end': int(self.user1_subscription.current_period_end.timestamp()), # Might be old period end
+                    'canceled_at': canceled_at_ts,
+                    'items': {'data': [{'price': {'id': self.user1_subscription.plan.stripe_price_id}}]}
+                }
+            }
+        }
+        mock_construct_event.return_value = mock_event_data
+
+        url = reverse('payments:stripe-webhook')
+        response = self.client.post(
+            url, data=mock_event_data, content_type='application/json',
+            HTTP_STRIPE_SIGNATURE='whsec_test_sig_mocked_delete'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.user1_subscription.refresh_from_db()
+        self.assertEqual(self.user1_subscription.status, 'cancelled')
+        self.assertEqual(int(self.user1_subscription.cancelled_at.timestamp()), canceled_at_ts)
+
+    def test_webhook_invalid_signature(self):
+        # No need to mock construct_event here, we want it to fail
+        url = reverse('payments:stripe-webhook')
+        response = self.client.post(
+            url,
+            data={"id": "evt_bad_sig", "type": "test"}, # Actual payload
+            content_type='application/json',
+            HTTP_STRIPE_SIGNATURE='whsec_invalid_signature' # This signature won't match
+        )
+        # This relies on stripe.Webhook.construct_event raising SignatureVerificationError
+        # which our view catches and returns 400.
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Invalid signature', response.data.get('error', '').lower())
+
+
+# TODO: Add more tests for:
+# - StripeWebhookView:
+#   - invoice.payment_failed
+#   - customer.subscription.updated (plan changes, trial ending soon handling)
+#   - checkout.session.completed (if using Stripe Checkout)
+#   - Other important Stripe events you handle.
+#   - Idempotency if you implement explicit checks (Stripe handles retries well though).
+# - UserSubscriptionViewSet:
+#   - create_subscription with PaymentIntent requires_action flow.
+#   - create_subscription with trial periods.
+#   - cancel_subscription when already cancelled or no subscription exists.
+#   - (If added) create_billing_portal_session action.
+# - Permissions for all actions on all ViewSets with different user types.
+# - Error handling for Stripe API errors (e.g., card declined).
