@@ -1,46 +1,31 @@
-Django Core
-Django==4.2.13  # Or the latest stable 4.2.x or 5.0.x version
+# requirements.txt
 
-Django REST Framework
-djangorestframework==3.15.1
-djangorestframework-simplejwt==5.3.1 # For JWT authentication
-django-cors-headers==4.3.1         # For Cross-Origin Resource Sharing
-django-filter==24.2                # For filtering in DRF views
-djangorestframework-nested==0.93.4 # For nested routing
+# --- Core Django & DRF ---
+Django>=4.2,<5.0
+djangorestframework>=3.14,<3.16
+djangorestframework-simplejwt>=5.3,<5.4
+django-cors-headers>=4.3,<4.4
+django-filter>=24.1,<25.0
+mysqlclient>=2.2,<2.3 # For MySQL connection
+python-dotenv>=1.0,<1.1 # For .env file handling
+gunicorn>=21.2,<22.1 # WSGI server for production
 
-Database Connector (Choose one based on your Cloud SQL for MySQL setup)
-mysqlclient==2.2.4 # For MySQL (Cloud SQL) - ensure build dependencies are met
-OR if you were to use PostgreSQL:
-psycopg2-binary==2.9.9 # For PostgreSQL
-WSGI Server (for deployment)
-gunicorn==22.0.0                   # Common choice for production
+# --- Google Cloud Platform ---
+django-storages[google]>=1.14,<1.15
+google-cloud-storage>=2.16,<2.17
+# google-cloud-sql-python-connector[mysql-psycopg2]>=1.7,<1.8 # Optional: If connecting from outside GCP / specific setups
+# google-cloud-logging>=3.9,<3.10 # Optional: For direct GCP Logging integration
 
-Stripe API Client
-stripe==9.3.0                      # Or the latest version
+# --- Utilities ---
+requests>=2.31,<2.33 # For making HTTP requests to AI services
+Pillow>=10.2,<10.3 # For ImageField support
+# celery>=5.3,<5.4 # Uncomment if you add Celery for background tasks
+# redis>=5.0,<5.1 # Uncomment if using Redis for Celery/Caching
 
-Google Cloud Libraries
-google-cloud-storage==2.16.0       # For GCS for static/media files (if used)
+# --- Stripe ---
+stripe>=8.5,<9.0
 
-google-cloud-sql-python-connector # For connecting to Cloud SQL securely, especially from local/other environments
-google-cloud-secret-manager # For managing secrets in GCP
-google-cloud-aiplatform # If using Vertex AI for AI models
-google-cloud-texttospeech # For TTS AI agent
-google-cloud-videointelligence # Potentially for TTV analysis or other video tasks
-google-cloud-translate # If using Cloud Translate for NLP/personalization
-Markdown processing (if converting Markdown to HTML in backend, e.g., for blog)
-Markdown==3.6
-bleach==6.1.0 # For sanitizing HTML output from Markdown
-Environment variable management
-python-dotenv==1.0.1               # For loading .env files in development
-
-Optional: For improved debugging or development utilities
-ipython==8.12.3 # Enhanced Python shell
-Werkzeug==3.0.2 # For runserver_plus if using django-extensions
-django-extensions==3.2.3 # Useful management commands
-Add any other specific libraries your project might need, e.g., for image processing, etc.
-Pillow==10.3.0 # For ImageField if you use it directly
-For testing (usually in a separate requirements-dev.txt or handled by poetry/pipenv dev-dependencies)
-coverage==7.5.0
-factory-boy==3.3.0 # For generating test data
-Note: Always check for the latest stable versions of these packages.
-Pinning versions (e.g., Django==4.2.13 instead of just Django) is crucial for reproducible builds.
+# --- Development & Testing ---
+# pytest-django # Recommended for testing
+# black # Code formatter
+# ruff # Linter
