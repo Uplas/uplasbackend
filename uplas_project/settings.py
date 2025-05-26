@@ -1,3 +1,4 @@
+# uplas_project/settings.py
 """
 Django settings for uplas_project project.
 
@@ -26,20 +27,14 @@ if os.path.exists(DOTENV_PATH):
     dotenv.load_dotenv(DOTENV_PATH)
 
 # --- Core Django Settings ---
-# SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-fallback-key-for-dev') # Fallback for dev
-
-# SECURITY WARNING: don't run with debug turned on in production!
-# DEBUG should be 'False' in production. Set via environment variable.
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True').lower() == 'true'
 
 ALLOWED_HOSTS_STRING = os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1')
 ALLOWED_HOSTS = [host.strip() for host in ALLOWED_HOSTS_STRING.split(',') if host.strip()]
-# Example for production: 'yourdomain.com,api.yourdomain.com'
 
-CSRF_TRUSTED_ORIGINS_STRING = os.environ.get('DJANGO_CSRF_TRUSTED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000')
+CSRF_TRUSTED_ORIGINS_STRING = os.environ.get('DJANGO_CSRF_TRUSTED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000,http://127.0.0.1:8000') # Added backend dev port
 CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in CSRF_TRUSTED_ORIGINS_STRING.split(',') if origin.strip()]
-# Example for production: 'https://yourdomain.com,https://api.yourdomain.com'
 
 
 # --- Application Definition ---
@@ -54,27 +49,27 @@ INSTALLED_APPS = [
     # Third-party apps
     'rest_framework',
     'rest_framework_simplejwt',
-    'rest_framework_simplejwt.token_blacklist', # For token blacklisting on logout/rotation
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
-    'django_filters', # For filtering in DRF
-    # 'storages', # For django-storages (GCS backend) - uncomment when GS_BUCKET_NAME is set
+    'django_filters',
+    # 'storages', # Conditionally added later if GS_BUCKET_NAME is set
 
-    # Your apps (ensure 'apps.' prefix is consistent with your project structure)
-    'apps.core.apps.CoreConfig', # Using AppConfig for better naming and ready() method
+    # Your apps
+    'apps.core.apps.CoreConfig',
     'apps.users.apps.UsersConfig',
     'apps.courses.apps.CoursesConfig',
     'apps.payments.apps.PaymentsConfig',
     'apps.projects.apps.ProjectsConfig',
     'apps.community.apps.CommunityConfig',
     'apps.blog.apps.BlogConfig',
-    # 'apps.ai_agents.apps.AiAgentsConfig', # Add if you have a dedicated ai_agents app
+    'apps.ai_agents.apps.AiAgentsConfig', # Assuming you will create this app
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    'corsheaders.middleware.CorsMiddleware', # CORS middleware - place high, before CommonMiddleware
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.locale.LocaleMiddleware', # For internationalization, place after Session and before Common
+    'django.middleware.locale.LocaleMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -82,12 +77,12 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-ROOT_URLCONF = 'uplas_project.urls' # Main project urls.py
+ROOT_URLCONF = 'uplas_project.urls'
 
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [BASE_DIR / 'templates'], # Project-level templates if any
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -101,17 +96,15 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'uplas_project.wsgi.application'
-ASGI_APPLICATION = 'uplas_project.asgi.application' # If using ASGI for Channels, etc.
+ASGI_APPLICATION = 'uplas_project.asgi.application'
 
 
 # --- Database ---
-# https://docs.djangoproject.com/en/4.2/ref/settings/#databases
-# Configured for Cloud SQL for MySQL using environment variables.
 DB_ENGINE = os.environ.get('DB_ENGINE', 'django.db.backends.mysql')
-DB_NAME = os.environ.get('DB_NAME', 'uplas_dev_db') # Default for local dev
-DB_USER = os.environ.get('DB_USER')
-DB_PASSWORD = os.environ.get('DB_PASSWORD')
-DB_HOST = os.environ.get('DB_HOST') # For Cloud SQL Proxy: 127.0.0.1. For direct connection (e.g. Cloud Run to Cloud SQL): Cloud SQL instance connection name or private IP.
+DB_NAME = os.environ.get('DB_NAME', 'uplas_dev_db')
+DB_USER = os.environ.get('DB_USER', 'root') # Common default for local MySQL
+DB_PASSWORD = os.environ.get('DB_PASSWORD', '') # Common default for local MySQL
+DB_HOST = os.environ.get('DB_HOST', '127.0.0.1') # For Cloud SQL Proxy or local
 DB_PORT = os.environ.get('DB_PORT', '3306')
 
 DATABASES = {
@@ -125,29 +118,16 @@ DATABASES = {
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
             'charset': 'utf8mb4',
-            # Add SSL options if connecting directly to Cloud SQL without proxy and require SSL
-            # 'ssl': {
-            #     'ca': os.environ.get('DB_SSL_CA_PATH'),
-            #     'cert': os.environ.get('DB_SSL_CERT_PATH'),
-            #     'key': os.environ.get('DB_SSL_KEY_PATH'),
-            # }
         },
     }
 }
-# For Cloud SQL connection from Cloud Run/Functions, use the instance connection name for HOST
-# if not using the Cloud SQL Proxy. Example: 'your-gcp-project:your-region:your-instance'
-# If using Cloud SQL Proxy, HOST is typically '127.0.0.1' and PORT is the proxy port.
-# In development, if using SQLite:
-# if DEBUG and not all([DB_NAME, DB_USER, DB_PASSWORD, DB_HOST]):
-#     print("WARNING: Database environment variables not fully set. Falling back to SQLite for local development.")
-#     DATABASES['default'] = {
-#         'ENGINE': 'django.db.backends.sqlite3',
-#         'NAME': BASE_DIR / 'db.sqlite3',
-#     }
 
+# If using Cloud SQL Auth Proxy, the above is fine.
+# For direct connections from App Engine Standard to Cloud SQL (same region):
+# if not DEBUG and 'google.cloud.sql.connector' not in sys.modules and os.getenv("INSTANCE_CONNECTION_NAME"):
+#    DATABASES['default']['HOST'] = f'/cloudsql/{os.getenv("INSTANCE_CONNECTION_NAME")}'
 
 # --- Password Validation ---
-# https://docs.djangoproject.com/en/4.2/ref/settings/#auth-password-validators
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
     {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
@@ -155,41 +135,31 @@ AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
 ]
 
-
 # --- Internationalization & Localization ---
-# https://docs.djangoproject.com/en/4.2/topics/i18n/
-LANGUAGE_CODE = os.environ.get('DJANGO_LANGUAGE_CODE', 'en-us') # Default language
-LANGUAGES = [ # Define available languages for your platform
+LANGUAGE_CODE = os.environ.get('DJANGO_LANGUAGE_CODE', 'en-us')
+LANGUAGES = [
     ('en', _('English')),
-    ('es', _('Spanish')), # Match with frontend: locales/es.json
-    ('fr', _('French')),  # Match with frontend: locales/fr.json
-    # Add other languages your platform supports
+    ('es', _('Spanish')),
+    ('fr', _('French')),
 ]
-LOCALE_PATHS = [BASE_DIR / 'locale'] # Directory for translation files (.po, .mo)
-TIME_ZONE = os.environ.get('DJANGO_TIME_ZONE', 'Africa/Nairobi') # Your primary timezone
-USE_I18N = True  # Enable internationalization
-USE_L10N = True  # DEPRECATED in Django 5.0, use USE_TZ and formatting libraries instead. Kept for Django 4.2.
-USE_TZ = True    # Enable timezone-aware datetimes (highly recommended)
-
+LOCALE_PATHS = [BASE_DIR / 'locale']
+TIME_ZONE = os.environ.get('DJANGO_TIME_ZONE', 'Africa/Nairobi')
+USE_I18N = True
+USE_L10N = True # Django 4.x
+USE_TZ = True
 
 # --- Static files (CSS, JavaScript, Images) & Media Files (User Uploads) ---
-# https://docs.djangoproject.com/en/4.2/howto/static-files/
-# https://docs.djangoproject.com/en/4.2/ref/settings/#std-setting-STORAGES (Django 4.2+)
-
 STATIC_URL = '/static/'
 MEDIA_URL = '/media/'
 
 if DEBUG:
-    # Development: serve static files with Django's staticfiles, media with runserver
-    STATICFILES_DIRS = [BASE_DIR / 'static'] # For finding static files during development
-    STATIC_ROOT = BASE_DIR / 'staticfiles_collected' # For collectstatic in dev (optional, more for prod prep)
-    MEDIA_ROOT = BASE_DIR / 'mediafiles'
-    # Ensure 'storages' is NOT in INSTALLED_APPS if GS_BUCKET_NAME is not set in dev
+    STATICFILES_DIRS = [BASE_DIR / 'static_dev'] # Renamed to avoid conflict if you have 'static' in root
+    STATIC_ROOT = BASE_DIR / 'staticfiles_collected_dev'
+    MEDIA_ROOT = BASE_DIR / 'mediafiles_dev'
 else:
-    # Production: Use Google Cloud Storage (django-storages)
     GS_BUCKET_NAME = os.environ.get('GS_BUCKET_NAME')
     if GS_BUCKET_NAME:
-        if 'storages' not in INSTALLED_APPS: # Dynamically add if configured
+        if 'storages' not in INSTALLED_APPS:
             INSTALLED_APPS.append('storages')
 
         STORAGES = {
@@ -197,9 +167,9 @@ else:
                 "BACKEND": "storages.backends.gcloud.GoogleCloudStorage",
                 "OPTIONS": {
                     "bucket_name": GS_BUCKET_NAME,
-                    "default_acl": "publicRead", # Or "projectPrivate" and serve via signed URLs or CDN
-                    "file_overwrite": False, # Important for media files
-                    "location": "media", # Subdirectory in the bucket for media
+                    "default_acl": "publicRead",
+                    "file_overwrite": False,
+                    "location": "media",
                 },
             },
             "staticfiles": { # For static files
@@ -207,85 +177,157 @@ else:
                 "OPTIONS": {
                     "bucket_name": GS_BUCKET_NAME,
                     "default_acl": "publicRead",
-                    "location": "static", # Subdirectory in the bucket for static
+                    "location": "static",
                 },
             },
         }
-        # STATIC_URL and MEDIA_URL are automatically constructed by django-storages
-        # based on bucket name and location if using GoogleCloudStorage.
-        # However, you can explicitly set them if needed for CDN or custom domain.
         STATIC_URL = f'https://storage.googleapis.com/{GS_BUCKET_NAME}/static/'
         MEDIA_URL = f'https://storage.googleapis.com/{GS_BUCKET_NAME}/media/'
-        # STATIC_ROOT and MEDIA_ROOT are not used by django-storages in the same way as local storage.
-        # `collectstatic` will upload to the GCS bucket.
     else:
-        # Fallback for production if GCS is not configured (not recommended for production)
-        print("WARNING: GS_BUCKET_NAME not set for production. Static/Media files might not be served correctly.")
-        STATIC_ROOT = BASE_DIR / 'staticfiles_collected'
-        MEDIA_ROOT = BASE_DIR / 'mediafiles'
-
+        print("PRODUCTION WARNING: GS_BUCKET_NAME not set. Static/Media files might not be served correctly from GCS.")
+        STATIC_ROOT = BASE_DIR / 'staticfiles_collected_prod'
+        MEDIA_ROOT = BASE_DIR / 'mediafiles_prod'
 
 # --- Default primary key field type ---
-# https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
 
 # --- Custom User Model ---
 AUTH_USER_MODEL = 'users.User'
-
 
 # --- Django REST Framework Settings ---
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
-        # Add SessionAuthentication if you also use Django admin or browsable API with sessions
-        # 'rest_framework.authentication.SessionAuthentication',
+        # 'rest_framework.authentication.SessionAuthentication', # If using browsable API with login
     ),
     'DEFAULT_PERMISSION_CLASSES': [
-        # More restrictive default, override per view if needed
-        'rest_framework.permissions.IsAuthenticated',
-        # 'rest_framework.permissions.IsAuthenticatedOrReadOnly', # Original default
+        'rest_framework.permissions.IsAuthenticatedOrReadOnly', # More common default
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': os.environ.get('DRF_PAGE_SIZE', 10), # Default 10, configurable
+    'PAGE_SIZE': int(os.environ.get('DRF_PAGE_SIZE', 10)),
     'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend'],
-    # Add other defaults like RENDERER_CLASSES, PARSER_CLASSES if needed
-    # 'DEFAULT_RENDERER_CLASSES': [
-    #     'rest_framework.renderers.JSONRenderer',
-    #     'rest_framework.renderers.BrowsableAPIRenderer', # For browsable API in dev
-    # ],
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ],
 }
-if DEBUG: # Add BrowsableAPIRenderer only in DEBUG
-    REST_FRAMEWORK.setdefault('DEFAULT_RENDERER_CLASSES', []).append('rest_framework.renderers.BrowsableAPIRenderer')
-    REST_FRAMEWORK.setdefault('DEFAULT_RENDERER_CLASSES', []).insert(0, 'rest_framework.renderers.JSONRenderer')
-
+if DEBUG:
+    REST_FRAMEWORK['DEFAULT_RENDERER_CLASSES'].append('rest_framework.renderers.BrowsableAPIRenderer')
 
 # --- Simple JWT Settings ---
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=int(os.environ.get('JWT_ACCESS_TOKEN_LIFETIME_MINUTES', 60))),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=int(os.environ.get('JWT_REFRESH_TOKEN_LIFETIME_DAYS', 7))),
     'ROTATE_REFRESH_TOKENS': True,
-    'BLACKLIST_AFTER_ROTATION': True, # Requires 'rest_framework_simplejwt.token_blacklist' in INSTALLED_APPS
-    'UPDATE_LAST_LOGIN': True, # Updates user's last_login field on token refresh
-
+    'BLACKLIST_AFTER_ROTATION': True,
+    'UPDATE_LAST_LOGIN': True,
     'ALGORITHM': 'HS256',
-    'SIGNING_KEY': SECRET_KEY, # Uses Django's SECRET_KEY by default
-    'VERIFYING_KEY': None,
-    'AUDIENCE': None,
-    'ISSUER': None,
-    'JWK_URL': None,
-    'LEEWAY': 0,
-
-    'AUTH_HEADER_TYPES': ('Bearer',), # Standard "Bearer <token>"
-    'AUTH_HEADER_NAME': 'HTTP_AUTHORIZATION',
-    'USER_ID_FIELD': 'id', # From your User model
+    'SIGNING_KEY': SECRET_KEY,
+    'AUTH_HEADER_TYPES': ('Bearer',),
+    'USER_ID_FIELD': 'id',
     'USER_ID_CLAIM': 'user_id',
-    'USER_AUTHENTICATION_RULE': 'rest_framework_simplejwt.authentication.default_user_authentication_rule',
+}
 
-    'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
-    'TOKEN_TYPE_CLAIM': 'token_type',
-    'TOKEN_USER_CLASS': 'rest_framework_simplejwt.models.TokenUser',
+# --- CORS Settings ---
+CORS_ALLOW_ALL_ORIGINS = DEBUG # Allow all origins in development
+CORS_ALLOWED_ORIGINS = [
+    origin.strip() for origin in os.environ.get('DJANGO_CORS_ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',') if origin.strip()
+]
+# Consider True if your frontend and backend are on the same site for cookies
+CORS_ALLOW_CREDENTIALS = True # If your frontend needs to send cookies (e.g., for CSRF with SessionAuth)
 
-    'JTI_CLAIM': 'jti',
+# --- Email Backend Configuration ---
+if DEBUG:
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend' # Prints emails to console in dev
+else:
+    EMAIL_BACKEND = os.environ.get('DJANGO_EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
+    EMAIL_HOST = os.environ.get('DJANGO_EMAIL_HOST')
+    EMAIL_PORT = int(os.environ.get('DJANGO_EMAIL_PORT', 587))
+    EMAIL_USE_TLS = os.environ.get('DJANGO_EMAIL_USE_TLS', 'True').lower() == 'true'
+    EMAIL_HOST_USER = os.environ.get('DJANGO_EMAIL_HOST_USER')
+    EMAIL_HOST_PASSWORD = os.environ.get('DJANGO_EMAIL_HOST_PASSWORD')
+    DEFAULT_FROM_EMAIL = os.environ.get('DJANGO_DEFAULT_FROM_EMAIL', 'noreply@uplas.me')
 
-    # 'SLIDI
+# --- Logging Configuration ---
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
+            'style': '{',
+        },
+        'simple': {
+            'format': '{levelname} {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'simple',
+        },
+        # Add file handler or cloud logging handler for production
+        # 'cloud_logging': {
+        #     'class': 'google.cloud.logging.handlers.CloudLoggingHandler',
+        #     'client': google.cloud.logging.Client(), # Requires google-cloud-logging
+        #     'formatter': 'verbose',
+        # }
+    },
+    'root': {
+        'handlers': ['console'], # Add 'cloud_logging' in production
+        'level': 'INFO', # Adjust level as needed (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['console'], # Add 'cloud_logging' in production
+            'level': os.getenv('DJANGO_LOG_LEVEL', 'INFO'),
+            'propagate': False,
+        },
+    },
+}
+
+
+# --- Custom Application Settings ---
+SITE_NAME = "UPLAS Platform"
+DEFAULT_CURRENCY = 'USD'
+CURRENCY_CHOICES = [
+    ('USD', _('US Dollar')),
+    ('EUR', _('Euro')),
+    ('KES', _('Kenyan Shilling')),
+    # Add other currencies as needed
+]
+WHATSAPP_CODE_EXPIRY_MINUTES = int(os.environ.get('WHATSAPP_CODE_EXPIRY_MINUTES', 10))
+
+# --- Stripe Settings ---
+STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY')
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY')
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET')
+
+# --- Celery Configuration (if using for background tasks) ---
+# CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+# CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
+# CELERY_ACCEPT_CONTENT = ['json']
+# CELERY_TASK_SERIALIZER = 'json'
+# CELERY_RESULT_SERIALIZER = 'json'
+# CELERY_TIMEZONE = TIME_ZONE
+
+# Ensure 'storages' app is correctly managed based on GS_BUCKET_NAME
+if not DEBUG and GS_BUCKET_NAME and 'storages' not in INSTALLED_APPS:
+    INSTALLED_APPS.append('storages')
+elif (DEBUG or not GS_BUCKET_NAME) and 'storages' in INSTALLED_APPS:
+    INSTALLED_APPS.remove('storages')
+
+
+# --- Security settings for Production (if not DEBUG) ---
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_SSL_REDIRECT = os.environ.get('DJANGO_SECURE_SSL_REDIRECT', 'True').lower() == 'true'
+    SESSION_COOKIE_SECURE = os.environ.get('DJANGO_SESSION_COOKIE_SECURE', 'True').lower() == 'true'
+    CSRF_COOKIE_SECURE = os.environ.get('DJANGO_CSRF_COOKIE_SECURE', 'True').lower() == 'true'
+    # HSTS settings - be careful when enabling these
+    # SECURE_HSTS_SECONDS = 31536000 # 1 year
+    # SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    # SECURE_HSTS_PRELOAD = True
+    # SECURE_CONTENT_TYPE_NOSNIFF = True
+    # SECURE_BROWSER_XSS_FILTER = True # Deprecated in modern browsers, use Content-Security-Policy
+    # X_FRAME_OPTIONS = 'DENY'
