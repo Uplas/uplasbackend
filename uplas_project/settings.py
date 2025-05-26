@@ -331,3 +331,15 @@ if not DEBUG:
     # SECURE_CONTENT_TYPE_NOSNIFF = True
     # SECURE_BROWSER_XSS_FILTER = True # Deprecated in modern browsers, use Content-Security-Policy
     # X_FRAME_OPTIONS = 'DENY'
+
+
+# --- AI Agent Service URLs ---
+# These URLs point to your independently deployed AI services from the 'uplas-ai-agents' repository
+AI_NLP_TUTOR_SERVICE_URL = os.environ.get('AI_NLP_TUTOR_SERVICE_URL', 'http://localhost:8001/api/v1/ai-tutor') # Example
+AI_TTS_SERVICE_URL = os.environ.get('AI_TTS_SERVICE_URL', 'http://localhost:8002/api/v1/tts')          # Example
+AI_TTV_SERVICE_URL = os.environ.get('AI_TTV_SERVICE_URL', 'http://localhost:8003/api/v1/ttv')          # Example
+AI_PROJECT_GENERATOR_SERVICE_URL = os.environ.get('AI_PROJECT_GENERATOR_SERVICE_URL', 'http://localhost:8004/api/v1/project-generator') # Example
+AI_PROJECT_ASSESSMENT_SERVICE_URL = os.environ.get('AI_PROJECT_ASSESSMENT_SERVICE_URL', 'http://localhost:8004/api/v1/project-assessment') # Example
+
+# You might also need API keys for these services if they are protected
+AI_SERVICE_API_KEY = os.environ.get('AI_SERVICE_API_KEY') # A common key or individual keys
