@@ -1,5 +1,5 @@
 # .github/workflows/django-ci.yml
-name: Django CI
+name: Django CI with MySQL
 
 on:
   push:
@@ -8,12 +8,26 @@ on:
     branches: [ main, develop ]
 
 jobs:
-  test: # Renamed job for clarity
+  test:
     runs-on: ubuntu-latest
     strategy:
-      max-parallel: 4
       matrix:
-        python-version: ["3.10"] # Focus on one primary version for CI speed, or keep all [3.9, "3.10", "3.11"]
+        python-version: ["3.10"] # Focus on one primary version
+
+    # --- Add MySQL Service Container ---
+    services:
+      mysql:
+        image: mysql:8.0 # Use a specific MySQL version
+        env:
+          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_TEST_ROOT_PASSWORD }} # ADD this secret
+          MYSQL_DATABASE: test_uplas_db
+        ports:
+          - 3306:3306 # Map container port to host port (for the runner)
+        options: >-
+          --health-cmd="mysqladmin ping" 
+          --health-interval=10s 
+          --health-timeout=5s 
+          --health-retries=3
 
     steps:
     - name: Checkout code
@@ -23,27 +37,31 @@ jobs:
       uses: actions/setup-python@v3
       with:
         python-version: ${{ matrix.python-version }}
-        cache: 'pip' # Cache dependencies for faster runs
+        cache: 'pip'
 
     - name: Install System Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y default-libmysqlclient-dev gcc # Even for SQLite, good to keep if needed
+        sudo apt-get install -y default-libmysqlclient-dev gcc python3-dev # Ensure mysqlclient build tools
 
     - name: Install Python Dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run Django Tests
+    - name: Run Django Tests with MySQL
       env:
         # --- Essential ---
-        SECRET_KEY: ${{ secrets.DJANGO_TEST_SECRET_KEY }} # ADD THIS SECRET in GitHub > Settings > Secrets > Actions
-        DJANGO_DEBUG: "True" # Usually True for tests
-        # --- Use SQLite for CI Tests ---
-        DB_ENGINE: "django.db.backends.sqlite3"
-        DB_NAME: ":memory:" # Use in-memory SQLite for max speed
-        # --- Dummy variables to prevent settings errors ---
+        SECRET_KEY: ${{ secrets.DJANGO_TEST_SECRET_KEY }}
+        DJANGO_DEBUG: "True"
+        # --- Use MySQL Service for CI Tests ---
+        DB_ENGINE: "django.db.backends.mysql"
+        DB_NAME: "test_uplas_db"
+        DB_USER: "root" # Use the root user for the test DB service
+        DB_PASSWORD: ${{ secrets.MYSQL_TEST_ROOT_PASSWORD }}
+        DB_HOST: "127.0.0.1" # The service is mapped to the runner's localhost
+        DB_PORT: "3306"
+        # --- Dummy variables ---
         DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1"
         STRIPE_SECRET_KEY: "dummy_stripe_key"
         AI_NLP_TUTOR_SERVICE_URL: "http://dummy.url"
@@ -52,7 +70,10 @@ jobs:
         AI_PROJECT_GENERATOR_SERVICE_URL: "http://dummy.url"
         AI_PROJECT_ASSESSMENT_SERVICE_URL: "http://dummy.url"
         AI_SERVICE_API_KEY: "dummy_ai_key"
-        # Add any other required environment variables here with dummy values
 
       run: |
-        python manage.py test # Run ALL tests in your project
+        # Wait a few seconds to ensure MySQL is fully ready (optional but can help)
+        sleep 10 
+        python manage.py makemigrations # Generate any pending migrations
+        python manage.py migrate --noinput # Apply migrations to the test DB
+        python manage.py test # Run ALL tests
