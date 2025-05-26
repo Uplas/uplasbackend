@@ -1,281 +1,245 @@
 # apps/ai_agents/views.py
-import requests # Or httpx for async if needed
+import requests
+import logging
 from django.conf import settings
 from rest_framework import status, views
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from .serializers import ( # Define these serializers
+from .serializers import (
     TutorQuestionSerializer, TutorResponseSerializer,
     TTSRequestSerializer, TTSResponseSerializer,
     TTVRequestSerializer, TTVResponseSerializer,
     ProjectIdeaRequestSerializer, ProjectIdeaResponseSerializer,
-    ProjectAssessmentRequestSerializer, ProjectAssessmentResponseSerializer
+    ProjectAssessmentRequestSerializer, ProjectAssessmentResponseSerializer,
+    AIRequestErrorSerializer
 )
+from apps.users.models import UserProfile # Need UserProfile for personalization data
+from apps.projects.models import ProjectAssessment, ProjectSubmission # For saving assessment results
 
-# --- Helper function to call external AI service ---
-def call_ai_service(service_url, method='post', data=None, headers=None, timeout=30):
-    default_headers = {}
-    if settings.AI_SERVICE_API_KEY: # If you use an API key for your internal AI services
-        default_headers['Authorization'] = f'Bearer {settings.AI_SERVICE_API_KEY}'
-    if headers:
-        default_headers.update(headers)
+# Get an instance of a logger
+logger = logging.getLogger(__name__)
+
+# --- Centralized AI Service Call Function ---
+def call_ai_service(service_url, method='post', data=None, timeout=60):
+    """
+    Calls an external AI service with standardized error handling.
+
+    Args:
+        service_url (str): The URL of the AI service endpoint.
+        method (str): HTTP method ('post' or 'get').
+        data (dict): Payload for 'post' or params for 'get'.
+        timeout (int): Request timeout in seconds.
+
+    Returns:
+        tuple: (response_data, error_response_data, status_code)
+               On success, (response_data, None, status_code).
+               On failure, (None, error_response_data, status_code).
+    """
+    if not service_url:
+        logger.error("AI service URL is not configured.")
+        return None, {"error": "AI service URL not configured."}, status.HTTP_501_NOT_IMPLEMENTED
+
+    headers = {}
+    if settings.AI_SERVICE_API_KEY:
+        headers['Authorization'] = f'Bearer {settings.AI_SERVICE_API_KEY}'
+    headers['Content-Type'] = 'application/json'
+    headers['Accept'] = 'application/json'
 
     try:
+        logger.info(f"Calling AI service: {service_url} with method: {method}")
         if method.lower() == 'post':
-            response = requests.post(service_url, json=data, headers=default_headers, timeout=timeout)
+            response = requests.post(service_url, json=data, headers=headers, timeout=timeout)
         elif method.lower() == 'get':
-            response = requests.get(service_url, params=data, headers=default_headers, timeout=timeout)
-        # Add other methods if needed (PUT, DELETE)
+            response = requests.get(service_url, params=data, headers=headers, timeout=timeout)
         else:
-            return None, {"error": "Unsupported HTTP method for AI service call"}, 500
+            logger.error(f"Unsupported HTTP method: {method}")
+            return None, {"error": "Unsupported HTTP method"}, status.HTTP_501_NOT_IMPLEMENTED
 
-        response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
-        return response.json(), None, response.status_code
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        
+        try:
+            response_json = response.json()
+            logger.info(f"AI service call successful. Status: {response.status_code}")
+            return response_json, None, response.status_code
+        except ValueError: # If response is not JSON
+            logger.error(f"AI service returned non-JSON response. Status: {response.status_code}. Response: {response.text[:200]}...")
+            return None, {"error": "AI service returned non-JSON response.", "details": response.text}, response.status_code
+
     except requests.exceptions.Timeout:
+        logger.warning(f"AI service call timed out: {service_url}")
         return None, {"error": "Request to AI service timed out."}, status.HTTP_504_GATEWAY_TIMEOUT
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"AI service connection error: {service_url}. Error: {e}")
         return None, {"error": "Could not connect to AI service."}, status.HTTP_503_SERVICE_UNAVAILABLE
     except requests.exceptions.HTTPError as e:
-        # Try to get error details from AI service response if possible
         error_detail = {"error": f"AI service returned an error: {e.response.status_code}"}
         try:
             error_detail.update(e.response.json())
-        except ValueError: # Not JSON
-            error_detail["raw_response"] = e.response.text
+        except ValueError:
+            error_detail["details"] = e.response.text[:500] # Limit raw response size
+        logger.warning(f"AI service HTTP error: {service_url}. Status: {e.response.status_code}. Details: {error_detail}")
         return None, error_detail, e.response.status_code
-    except Exception as e: # Catch-all for other unexpected errors
-        # Log this exception 'e'
-        return None, {"error": f"An unexpected error occurred while communicating with AI service: {str(e)}"}, status.HTTP_500_INTERNAL_SERVER_ERROR
+    except Exception as e:
+        logger.critical(f"Unexpected error calling AI service: {service_url}. Error: {e}", exc_info=True)
+        return None, {"error": f"An unexpected error occurred: {str(e)}"}, status.HTTP_500_INTERNAL_SERVER_ERROR
 
-
-# --- AI Tutor View ---
-class AskAITutorView(views.APIView):
+# --- Base AI View ---
+class BaseAIAgentView(views.APIView):
+    """Base view for handling AI agent requests."""
     permission_classes = [IsAuthenticated]
-    serializer_class = TutorQuestionSerializer # For request validation
+    request_serializer_class = None
+    response_serializer_class = None
+    ai_service_url_setting = None
+    ai_service_endpoint = "" # Specific path like '/ask' or '/generate'
+
+    def get_ai_service_url(self):
+        base_url = getattr(settings, self.ai_service_url_setting, None)
+        return base_url + self.ai_service_endpoint if base_url else None
+
+    def build_payload(self, request, validated_data):
+        """Build the payload to send to the AI service. Needs personalization."""
+        user = request.user
+        try:
+            profile = user.profile
+        except UserProfile.DoesNotExist:
+            profile = None # Handle cases where profile might not exist yet
+
+        payload = {
+            'user_id': str(user.id),
+            'user_profile_data': {
+                'career': getattr(user, 'profession', None) or getattr(user, 'career_interest', None),
+                'location': getattr(user, 'city', None) or getattr(user, 'country', None),
+                'industry': getattr(user, 'industry', None),
+                'learning_goals': getattr(profile, 'learning_goals', None) if profile else None,
+                'preferred_language': getattr(user, 'preferred_language', 'en'),
+                'interests': getattr(profile, 'areas_of_interest', None) if profile else None,
+            },
+            **validated_data # Add validated data from the request
+        }
+        return payload
+
+    def process_ai_response(self, ai_response_data, request, validated_data):
+        """Hook to process the AI response before sending it back or saving."""
+        return ai_response_data # Default: just return it
 
     def post(self, request, *args, **kwargs):
-        serializer = self.serializer_class(data=request.data)
+        if not self.request_serializer_class:
+            return Response({"error": "View not configured correctly (request_serializer_class missing)."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        serializer = self.request_serializer_class(data=request.data, context={'request': request})
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        # Prepare data for the AI Tutor service
-        # Include user-specific data for personalization from request.user and request.user.profile
-        payload = {
-            'user_id': str(request.user.id),
-            'user_profile_data': {
-                'career': request.user.profession or request.user.career_interest,
-                'location': request.user.city or request.user.country,
-                'industry': request.user.industry,
-                'other_industry_details': request.user.other_industry_details,
-                'learning_goals': request.user.profile.learning_goals,
-                # Add other relevant fields from User and UserProfile
-            },
-            'question_text': serializer.validated_data['question_text'],
-            'module_context': serializer.validated_data.get('module_context'), # Optional
-            'topic_context': serializer.validated_data.get('topic_context'),   # Optional
-        }
+        payload = self.build_payload(request, serializer.validated_data)
+        service_url = self.get_ai_service_url()
 
-        ai_response, error_data, status_code = call_ai_service(
-            settings.AI_NLP_TUTOR_SERVICE_URL + "/ask", # Example endpoint
-            data=payload
-        )
+        ai_response, error_data, status_code = call_ai_service(service_url, data=payload)
 
         if error_data:
             return Response(error_data, status=status_code)
-        
-        # Validate and return the AI's response
-        response_serializer = TutorResponseSerializer(data=ai_response)
+
+        # Process the response (e.g., save assessment)
+        processed_response = self.process_ai_response(ai_response, request, serializer.validated_data)
+
+
+        if not self.response_serializer_class:
+             return Response({"error": "View not configured correctly (response_serializer_class missing)."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        response_serializer = self.response_serializer_class(data=processed_response)
         if response_serializer.is_valid():
             return Response(response_serializer.validated_data, status=status.HTTP_200_OK)
         else:
-            # Log this: AI service returned unexpected format
-            return Response({"error": "Invalid response format from AI Tutor service.", "details": response_serializer.errors}, status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.error(f"Invalid response format from AI service ({service_url}) or processing. Errors: {response_serializer.errors}")
+            return Response({"error": "Invalid response format from AI service.", "details": response_serializer.errors}, status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-# Assign to the name used in urls.py
+# --- Specific Views ---
+class AskAITutorView(BaseAIAgentView):
+    request_serializer_class = TutorQuestionSerializer
+    response_serializer_class = TutorResponseSerializer
+    ai_service_url_setting = 'AI_NLP_TUTOR_SERVICE_URL'
+    ai_service_endpoint = "/ask" # Assuming this endpoint
+
 ask_ai_tutor_view = AskAITutorView.as_view()
 
-
-# --- Text-to-Speech (TTS) View ---
-class GenerateTTSView(views.APIView):
-    permission_classes = [IsAuthenticated]
-    serializer_class = TTSRequestSerializer
-
-    def post(self, request, *args, **kwargs):
-        serializer = self.serializer_class(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        payload = {
-            'text_to_convert': serializer.validated_data['text'],
-            'voice_character': serializer.validated_data.get('voice_character') or request.user.profile.preferred_tts_voice_character or 'alloy', # Default if none
-            'language': request.user.preferred_language or 'en',
-            # Add other parameters your TTS service might need
-        }
-        
-        ai_response, error_data, status_code = call_ai_service(
-            settings.AI_TTS_SERVICE_URL + "/generate",
-            data=payload
-        )
-
-        if error_data:
-            return Response(error_data, status=status_code)
-        
-        response_serializer = TTSResponseSerializer(data=ai_response)
-        if response_serializer.is_valid():
-            # The response might contain a URL to the audio file, or binary data
-            return Response(response_serializer.validated_data, status=status.HTTP_200_OK)
-        else:
-            return Response({"error": "Invalid response format from TTS service.", "details": response_serializer.errors}, status.HTTP_500_INTERNAL_SERVER_ERROR)
+class GenerateTTSView(BaseAIAgentView):
+    request_serializer_class = TTSRequestSerializer
+    response_serializer_class = TTSResponseSerializer
+    ai_service_url_setting = 'AI_TTS_SERVICE_URL'
+    ai_service_endpoint = "/generate"
 
 generate_tts_view = GenerateTTSView.as_view()
 
-
-# --- Text-to-Video (TTV) View ---
-class GenerateTTVView(views.APIView):
-    permission_classes = [IsAuthenticated]
-    serializer_class = TTVRequestSerializer # text, module_data, user_data
-
-    def post(self, request, *args, **kwargs):
-        serializer = self.serializer_class(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        payload = {
-            'script_text': serializer.validated_data['script_text'],
-            'instructor_character': serializer.validated_data.get('instructor_character') or request.user.profile.preferred_ttv_instructor or 'Uncle Trevor', # e.g., 'Uncle Trevor', 'Susan'
-            'module_info': serializer.validated_data.get('module_info'), # Context for personalization
-            'topic_info': serializer.validated_data.get('topic_info'),   # Context for personalization
-            'user_profile_data': { # For personalized explanations
-                'career': request.user.profession or request.user.career_interest,
-                'learning_goals': request.user.profile.learning_goals,
-            }
-        }
-
-        ai_response, error_data, status_code = call_ai_service(
-            settings.AI_TTV_SERVICE_URL + "/generate",
-            data=payload
-        )
-        if error_data:
-            return Response(error_data, status=status_code)
-        
-        response_serializer = TTVResponseSerializer(data=ai_response)
-        if response_serializer.is_valid():
-            # Response might contain a URL to the video or status of generation
-            return Response(response_serializer.validated_data, status.HTTP_200_OK)
-        else:
-            return Response({"error": "Invalid response format from TTV service.", "details": response_serializer.errors}, status.HTTP_500_INTERNAL_SERVER_ERROR)
+class GenerateTTVView(BaseAIAgentView):
+    request_serializer_class = TTVRequestSerializer
+    response_serializer_class = TTVResponseSerializer
+    ai_service_url_setting = 'AI_TTV_SERVICE_URL'
+    ai_service_endpoint = "/generate"
 
 generate_ttv_view = GenerateTTVView.as_view()
 
-
-# --- AI Project Generator View ---
-class GenerateProjectIdeaView(views.APIView):
-    permission_classes = [IsAuthenticated] # Or specific permission if project generation is restricted
-    serializer_class = ProjectIdeaRequestSerializer # e.g., topic, user_interests
-
-    def post(self, request, *args, **kwargs):
-        serializer = self.serializer_class(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        
-        payload = {
-            'user_id': str(request.user.id),
-            'user_profile_data': {
-                'industry': request.user.industry,
-                'interests': request.user.profile.areas_of_interest,
-                'current_skills': request.user.profile.current_knowledge_level,
-            },
-            'course_context': serializer.validated_data.get('course_context'), # Optional
-            'topic_context': serializer.validated_data.get('topic_context'), # Optional
-        }
-
-        ai_response, error_data, status_code = call_ai_service(
-            settings.AI_PROJECT_GENERATOR_SERVICE_URL + "/generate-idea",
-            data=payload
-        )
-        if error_data:
-            return Response(error_data, status=status_code)
-            
-        response_serializer = ProjectIdeaResponseSerializer(data=ai_response) # title, description, tech_stack, etc.
-        if response_serializer.is_valid():
-            # TODO: Optionally save this generated project idea to the Project model in this backend
-            # (e.g., as an AI-generated, unpublished project definition for the user to start)
-            # Project.objects.create(
-            #     title=response_serializer.validated_data['title'],
-            #     description=response_serializer.validated_data['description'],
-            #     created_by=request.user, # Or a system AI user
-            #     ai_generated=True,
-            #     is_published=False,
-            #     # ... map other fields ...
-            # )
-            return Response(response_serializer.validated_data, status.HTTP_200_OK)
-        else:
-            return Response({"error": "Invalid response format from Project Generator service.", "details": response_serializer.errors}, status.HTTP_500_INTERNAL_SERVER_ERROR)
+class GenerateProjectIdeaView(BaseAIAgentView):
+    request_serializer_class = ProjectIdeaRequestSerializer
+    response_serializer_class = ProjectIdeaResponseSerializer
+    ai_service_url_setting = 'AI_PROJECT_GENERATOR_SERVICE_URL'
+    ai_service_endpoint = "/generate-idea"
 
 generate_project_idea_view = GenerateProjectIdeaView.as_view()
 
+class AssessProjectView(BaseAIAgentView):
+    request_serializer_class = ProjectAssessmentRequestSerializer
+    response_serializer_class = ProjectAssessmentResponseSerializer # Response from AI
+    ai_service_url_setting = 'AI_PROJECT_ASSESSMENT_SERVICE_URL'
+    ai_service_endpoint = "/assess"
 
-# --- AI Project Assessment View ---
-class AssessProjectView(views.APIView):
-    permission_classes = [IsAuthenticated] # User submitting their project
-    serializer_class = ProjectAssessmentRequestSerializer # e.g., project_submission_id, repository_url
-
-    def post(self, request, *args, **kwargs):
-        serializer = self.serializer_class(data=request.data, context={'request': request})
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        user_project_submission = serializer.validated_data['user_project_submission'] # This is the ProjectSubmission instance
-
+    def build_payload(self, request, validated_data):
+        """Override to build payload specific to assessment."""
+        submission = self.context['submission_instance'] # Get instance from serializer validation
         payload = {
-            'submission_id': str(user_project_submission.id),
-            'repository_url': user_project_submission.submission_artifacts.get('repository_url') or user_project_submission.user_project.repository_url,
-            'live_url': user_project_submission.submission_artifacts.get('live_demo_url') or user_project_submission.user_project.live_url,
-            'project_definition_id': str(user_project_submission.user_project.project_id),
-            'project_title': user_project_submission.user_project.project.title,
-            'project_guidelines': user_project_submission.user_project.project.guidelines, # Send guidelines for assessment
+            'submission_id': str(submission.id),
+            'repository_url': submission.submission_artifacts.get('repository_url'),
+            'live_url': submission.submission_artifacts.get('live_demo_url'),
+            'project_definition_id': str(submission.user_project.project_id),
+            'project_title': submission.user_project.project.title,
+            'project_guidelines': submission.user_project.project.guidelines,
             'user_id': str(request.user.id),
         }
+        return payload
 
-        ai_response, error_data, status_code = call_ai_service(
-            settings.AI_PROJECT_ASSESSMENT_SERVICE_URL + "/assess",
-            data=payload
-        )
-        if error_data:
-            return Response(error_data, status=status_code)
+    def process_ai_response(self, ai_response_data, request, validated_data):
+        """Override to save the assessment result."""
+        submission = self.context['submission_instance']
         
-        response_serializer = ProjectAssessmentResponseSerializer(data=ai_response) # score, feedback, passed_status
-        if response_serializer.is_valid():
-            # TODO: Save this assessment to the ProjectAssessment model in this backend
-            # This is already handled by the `apps.projects.views.ProjectAssessmentViewSet.submit_ai_assessment`
-            # So, this view might directly call that internal service method if the AI agent
-            # is *also* calling back to this backend.
-            # OR, if this view is what the UPLAS frontend calls, and then this view calls the external AI,
-            # then this view should process the AI response and create the ProjectAssessment record.
-            
-            # For example, creating the ProjectAssessment record here:
-            # from apps.projects.models import ProjectAssessment
-            # assessment = ProjectAssessment.objects.create(
-            #     submission=user_project_submission,
-            #     assessed_by_ai=True,
-            #     assessor_ai_agent_name=response_serializer.validated_data.get('assessor_ai_agent_name', 'UPLAS AI Assessor'),
-            #     score=response_serializer.validated_data['score'],
-            #     passed=response_serializer.validated_data['passed'],
-            #     feedback_summary=response_serializer.validated_data['feedback_summary'],
-            #     detailed_feedback=response_serializer.validated_data.get('detailed_feedback', {})
-            # )
-            # The save() method of ProjectAssessment model handles UserProject status update.
-
-            # If the ProjectAssessmentViewSet's `submit-ai-assessment` action is the target for the AI service,
-            # then this view might not be needed, or it's a passthrough.
-            # Your `apps/projects/views.py` has ProjectAssessmentViewSet with `submit-ai-assessment` action.
-            # It's better if the AI agent calls that endpoint directly.
-            # This current view (`AssessProjectView` in `apps.ai_agents`) would be what the *UPLAS Frontend* calls
-            # to initiate the assessment, which then calls the external AI. The AI service, upon completion,
-            # would then call back to the `/api/projects/project-assessments/submit-ai-assessment/` endpoint.
-
-            return Response(response_serializer.validated_data, status.HTTP_200_OK)
+        # We need to validate the AI response before saving
+        assessment_serializer = ProjectAssessmentResponseSerializer(data=ai_response_data)
+        if assessment_serializer.is_valid():
+            assessment_data = assessment_serializer.validated_data
+            try:
+                # Use update_or_create to handle re-assessments
+                assessment, created = ProjectAssessment.objects.update_or_create(
+                    submission=submission,
+                    defaults={
+                        'assessed_by_ai': True,
+                        'assessor_ai_agent_name': assessment_data.get('assessor_ai_agent_name', 'UPLAS AI Assessor'),
+                        'score': assessment_data['score'],
+                        'passed': assessment_data['passed'],
+                        'feedback_summary': assessment_data['feedback_summary'],
+                        'detailed_feedback': assessment_data.get('detailed_feedback', {}),
+                        'status': 'completed',
+                    }
+                )
+                logger.info(f"Project assessment {'created' if created else 'updated'} for submission {submission.id}.")
+                # The ProjectAssessment model's save() method should handle updating UserProject status.
+                return assessment_data # Return the validated data
+            except Exception as e:
+                logger.error(f"Failed to save project assessment for {submission.id}. Error: {e}", exc_info=True)
+                # This should ideally return an error response, but BaseAIAgentView handles that.
+                # We raise an exception here or return something that indicates failure.
+                # For now, we'll let it fall through and potentially fail the response serialization.
+                # A better way might be to add error handling here.
+                return {"error": "Failed to save assessment results."} # Return an error structure
         else:
-             return Response({"error": "Invalid response format from Project Assessment service.", "details": response_serializer.errors}, status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.error(f"AI Assessment service returned invalid data: {assessment_serializer.errors}")
+            return {"error": "Invalid response format from AI Assessment service.", "details": assessment_serializer.errors}
+
 
 assess_project_view = AssessProjectView.as_view()
