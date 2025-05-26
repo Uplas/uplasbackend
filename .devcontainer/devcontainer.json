@@ -1,1 +1,31 @@
-
+{
+    "name": "UPLAS Django Backend",
+    "dockerComposeFile": [
+        "../docker-compose.yml" // Assumes you create a docker-compose.yml
+    ],
+    "service": "web", // Django service name in docker-compose.yml
+    "workspaceFolder": "/app",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "python.pythonPath": "/usr/local/bin/python",
+                "python.linting.pylintEnabled": false,
+                "python.linting.enabled": true,
+                "python.formatting.provider": "black",
+                "editor.formatOnSave": true,
+                "python.testing.pytestEnabled": true,
+                "python.testing.pytestArgs": [
+                    "apps"
+                ]
+            },
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "charliermarsh.ruff"
+            ]
+        }
+    },
+    "forwardPorts": [8000],
+    "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt && python manage.py migrate",
+    "remoteUser": "vscode"
+}
