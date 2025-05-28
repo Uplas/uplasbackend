@@ -1,127 +1,133 @@
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import RefreshToken
+# UserLoginSerializer was removed as the UserLoginView that used it is removed.
+# SimpleJWT's TokenObtainPairView is used instead via urls.py.
+# from .serializers import UserLoginSerializer
+from django.utils.translation import gettext_lazy as _
+from django.contrib.auth import get_user_model
 from django.utils import timezone
 from datetime import timedelta
-from django.contrib.auth import get_user_model # Use get_user_model()
-from django.shortcuts import get_object_or_404
-
 
 from .serializers import (
-    UserSerializer, UserRegistrationSerializer, UserLoginSerializer,
-    UserProfileSerializer, WhatsAppVerificationSerializer
+    UserSerializer,
+    UserRegistrationSerializer,
+    PasswordChangeSerializer, # Added import
+    SendWhatsAppVerificationSerializer, # Added import
+    VerifyWhatsAppSerializer # Added import
 )
-# from .permissions import IsOwnerOrAdminOrReadOnly # If you create custom permissions
+from .permissions import IsAccountOwnerOrReadOnly # Assuming this is the primary permission for UserProfileView
 
 User = get_user_model()
 
-class UserRegistrationView(generics.CreateAPIView): # POST /api/users/register/ 
+class UserRegistrationView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = UserRegistrationSerializer
     permission_classes = [permissions.AllowAny]
 
-    # perform_create is handled by serializer's create method
+# UserLoginView has been removed as per feedback (it was unused).
+# TokenObtainPairView from SimpleJWT is used directly in urls.py.
 
-class UserLoginView(APIView): # POST /api/users/login/ 
-    permission_classes = [permissions.AllowAny]
-    serializer_class = UserLoginSerializer # Use the serializer for validation
-
-    def post(self, request, *args, **kwargs):
-        serializer = self.serializer_class(data=request.data, context={'request': request})
-        serializer.is_valid(raise_exception=True)
-        user = serializer.validated_data['user']
-        
-        refresh = RefreshToken.for_user(user)
-        user_data = UserSerializer(user, context={'request': request}).data
-
-        return Response({
-            'refresh': str(refresh),
-            'access': str(refresh.access_token),
-            'user': user_data
-        })
-
-class UserProfileViewSet(viewsets.ModelViewSet): # Replaces UserProfileView for more standard GET/PUT/PATCH
+class UserProfileView(generics.RetrieveUpdateAPIView):
     """
     API endpoint for the current authenticated user's profile.
-    GET, PUT, PATCH /api/users/profile/  (Implicitly for current user)
-    
+    GET to retrieve, PUT/PATCH to update.
+    Accessible at /api/users/profile/
     """
-    serializer_class = UserSerializer # Uses UserSerializer which includes UserProfileSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = UserSerializer
+    permission_classes = [permissions.IsAuthenticated, IsAccountOwnerOrReadOnly]
 
     def get_object(self):
-        # Returns the currently authenticated user
+        # IsAccountOwnerOrReadOnly permission will ensure only owner or admin can PUT/PATCH.
+        # For GET, IsAuthenticated is enough.
         return self.request.user
-    
-    def get_queryset(self): # Required for base ModelViewSet, even if get_object is overridden for detail views
-        return User.objects.filter(pk=self.request.user.pk)
 
-    # Standard ModelViewSet actions (retrieve, update, partial_update) will work.
-    # List and Destroy are typically not wanted for a '/profile/' endpoint referring to self.
-    def list(self, request, *args, **kwargs):
-        return Response(self.get_serializer(self.request.user).data)
+    def get_queryset(self):
+        # Although get_object is used, providing a queryset is good practice for ViewSet.
+        # For retrieve/update of a single user profile, this helps with potential pre-fetching if UserSerializer becomes more complex.
+        return User.objects.select_related('profile').filter(pk=self.request.user.pk)
 
-    def destroy(self, request, *args, **kwargs):
-        return Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
-    
-    # If you wanted a separate /api/users/{id}/ endpoint for admins, you'd create another ViewSet.
 
-class SendWhatsAppVerificationView(APIView): # POST /api/users/send-whatsapp-code/ 
+class PasswordChangeView(generics.UpdateAPIView):
+    """
+    An endpoint for changing password.
+    """
+    serializer_class = PasswordChangeSerializer
+    model = User
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get_object(self, queryset=None):
+        return self.request.user
+
+    def update(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+
+        if serializer.is_valid():
+            # Check old password
+            if not self.object.check_password(serializer.data.get("old_password")):
+                return Response({"old_password": [_("Wrong password.")]}, status=status.HTTP_400_BAD_REQUEST)
+            # set_password also hashes the password that the user will get
+            self.object.set_password(serializer.data.get("new_password"))
+            self.object.save()
+            return Response({"detail": _("Password updated successfully.")}, status=status.HTTP_200_OK)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SendWhatsAppVerificationView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SendWhatsAppVerificationSerializer
 
     def post(self, request, *args, **kwargs):
-        user = request.user
-        if not user.whatsapp_number:
-            return Response({'detail': _('Please add your WhatsApp number in your profile first.')}, status=status.HTTP_400_BAD_REQUEST)
-        
-        if user.is_whatsapp_verified:
-            return Response({'detail': _('Your WhatsApp number is already verified.')}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = self.serializer_class(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        if user.whatsapp_code_created_at and timezone.now() < user.whatsapp_code_created_at + timedelta(minutes=2):
+        user = request.user
+        new_whatsapp_number = serializer.validated_data['whatsapp_number']
+
+        # Check if this number is already verified by another user
+        if User.objects.filter(whatsapp_number=new_whatsapp_number, is_whatsapp_verified=True).exclude(pk=user.pk).exists():
+            return Response({'error': _('This WhatsApp number is already verified by another account.')}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.whatsapp_number = new_whatsapp_number # Update user's number
+        
+        # Prevent rapid re-requests for code generation
+        if user.whatsapp_code_created_at and timezone.now() < user.whatsapp_code_created_at + timedelta(minutes=1): # 1 minute cooldown
              return Response({'detail': _('Verification code recently sent. Please wait before requesting a new one.')}, status=status.HTTP_429_TOO_MANY_REQUESTS)
 
-        code = user.generate_whatsapp_code()
-        
+        code = user.generate_whatsapp_code() # This method now saves the user instance with the new code and timestamp
+
         # TODO: Integrate with a real WhatsApp API provider (e.g., Twilio, Vonage, Meta API)
-        # Placeholder for sending logic:
         print(f"SIMULATED: Sent WhatsApp verification code {code} to {user.whatsapp_number} for user {user.email}")
         # In a real scenario:
         # success = send_whatsapp_message_via_api(user.whatsapp_number, f"Your Uplas verification code is: {code}")
         # if not success:
         #     return Response({'detail': 'Failed to send verification code. Please try again later.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         
-        return Response({'detail': _('Verification code sent to your WhatsApp number.')}, status=status.HTTP_200_OK)
+        return Response({
+            'detail': _('Verification code sent to your WhatsApp number.'),
+            'whatsapp_number': user.whatsapp_number # Return the number it was sent to
+            }, status=status.HTTP_200_OK)
 
-class VerifyWhatsAppView(APIView): # POST /api/users/verify-whatsapp/ 
+
+class VerifyWhatsAppView(APIView):
     permission_classes = [permissions.IsAuthenticated]
-    serializer_class = WhatsAppVerificationSerializer
+    serializer_class = VerifyWhatsAppSerializer
 
     def post(self, request, *args, **kwargs):
-        serializer = self.serializer_class(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
         user = request.user
-        provided_code = serializer.validated_data['code']
+        # Pass context to serializer if it needs the request/user
+        serializer = self.serializer_class(data=request.data, context={'request': request})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        if user.is_whatsapp_verified:
-            return Response({'detail': _('WhatsApp number already verified.')}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not user.whatsapp_verification_code or not user.whatsapp_code_created_at:
-            return Response({'detail': _('No verification code was found for your account. Please request one first.')}, status=status.HTTP_400_BAD_REQUEST)
-
-        if timezone.now() > user.whatsapp_code_created_at + timedelta(minutes=10): # Code expiry
-            user.whatsapp_verification_code = None
-            user.whatsapp_code_created_at = None
-            user.save(update_fields=['whatsapp_verification_code', 'whatsapp_code_created_at'])
-            return Response({'detail': _('Verification code has expired. Please request a new one.')}, status=status.HTTP_400_BAD_REQUEST)
-
-        if user.whatsapp_verification_code == provided_code:
-            user.is_whatsapp_verified = True
-            user.whatsapp_verification_code = None 
-            user.whatsapp_code_created_at = None
-            user.save(update_fields=['is_whatsapp_verified', 'whatsapp_verification_code', 'whatsapp_code_created_at'])
-            return Response({'detail': _('WhatsApp number verified successfully.')}, status=status.HTTP_200_OK)
-        else:
-            # TODO: Implement attempt counter to prevent brute-force if desired
-            return Response({'detail': _('Invalid verification code.')}, status=status.HTTP_400_BAD_REQUEST)
+        # Serializer validation already checks code validity and expiry
+        
+        user.is_whatsapp_verified = True
+        user.whatsapp_verification_code = None # Clear code after successful verification
+        # whatsapp_code_created_at is not cleared here, but new codes will overwrite it.
+        user.save(update_fields=['is_whatsapp_verified', 'whatsapp_verification_code'])
+        
+        return Response({'detail': _('WhatsApp number verified successfully.')}, status=status.HTTP_200_OK)
