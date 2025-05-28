@@ -7,6 +7,7 @@ from django.utils import timezone
 from django.conf import settings # For project-wide choices if any
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+import re # For username generation
 
 # Assuming BaseModel is in apps.core.models
 from apps.core.models import BaseModel # Import your BaseModel
@@ -40,16 +41,36 @@ class UserManager(BaseUserManager):
     for authentication instead of usernames.
     """
     def _generate_unique_username(self, email_prefix):
-        """Generates a unique username based on email prefix."""
-        username = email_prefix
-        # Try with a random number first
-        temp_username = f"{email_prefix}_{random.randint(1000, 9999)}"
+        """
+        Generates a unique username based on email prefix.
+        Ensures username is valid (alphanumeric, periods, hyphens, underscores)
+        and does not exceed 150 characters.
+        """
+        # Sanitize email_prefix to allow only valid username characters
+        # Keep letters, digits, and @/./+/-/_
+        sanitized_prefix = re.sub(r'[^\w.@+-]', '', email_prefix)
+        
+        # Ensure the base prefix is not too long
+        base_username = sanitized_prefix[:130] # Reserve space for suffix
+
+        # Attempt 1: Simple numeric suffix
+        temp_username = f"{base_username}_{random.randint(1000, 9999)}"
         if not User.objects.filter(username=temp_username).exists():
             return temp_username
-        # If collision, use a short UUID
+
+        # Attempt 2: Shorter numeric suffix if first was too long or collided
+        temp_username = f"{base_username[:135]}_{random.randint(100, 999)}"
+        if not User.objects.filter(username=temp_username).exists():
+            return temp_username
+            
+        # Attempt 3: Short UUID suffix as a more robust fallback
+        # Ensure the final username does not exceed 150 characters.
+        # Max length of UUID hex is 32. We use 8 chars.
+        # Max prefix length = 150 - 1 (for underscore) - 8 (for short_uuid) = 141
+        prefix_for_uuid = base_username[:141]
         while True:
-            short_uuid = uuid.uuid4().hex[:6]
-            username = f"{email_prefix[:143-len(short_uuid)]}_{short_uuid}" # Ensure username length constraint
+            short_uuid = uuid.uuid4().hex[:8] # Use 8 chars for better uniqueness
+            username = f"{prefix_for_uuid}_{short_uuid}"
             if not User.objects.filter(username=username).exists():
                 return username
 
@@ -62,10 +83,12 @@ class UserManager(BaseUserManager):
         email = self.normalize_email(email)
 
         if not username:
-            email_prefix = email.split('@')[0].replace('.', '_').replace('-', '_')[:130]
+            email_prefix = email.split('@')[0]
             username = self._generate_unique_username(email_prefix)
         
-        extra_fields.setdefault('username', username) # Set username
+        # Ensure username is explicitly set in extra_fields if passed, or use generated.
+        extra_fields.setdefault('username', username)
+        
         user = self.model(email=email, **extra_fields)
         user.set_password(password)
         user.save(using=self._db)
@@ -84,6 +107,17 @@ class UserManager(BaseUserManager):
         if extra_fields.get('is_superuser') is not True:
             raise ValueError(_('Superuser must have is_superuser=True.'))
         
+        # For superuser, if username is not provided, generate it but ensure it's predictable or simple.
+        # However, for CLI creation, username is usually prompted.
+        # The AbstractUser.REQUIRED_FIELDS includes 'username', so it must be present.
+        if not username:
+             email_prefix = email.split('@')[0]
+             # A simpler approach for superuser if direct creation, ensure it's unique.
+             # For createsuperuser command, Django handles prompting for username.
+             # This manager method might be called programmatically.
+             username = self._generate_unique_username(email_prefix)
+
+
         return self.create_user(email, password, username=username, **extra_fields)
 
 
@@ -92,6 +126,8 @@ class User(AbstractUser):
     Custom User model inheriting from AbstractUser.
     Uses email as the primary identifier for authentication.
     """
+    # Username: Still required by Django's AbstractUser, but we auto-generate it if not provided.
+    # Email is the primary login field (USERNAME_FIELD).
     username = models.CharField(
         _('username'),
         max_length=150,
@@ -101,7 +137,7 @@ class User(AbstractUser):
         error_messages={
             'unique': _("A user with that username already exists."),
         },
-        db_index=True # Added for performance
+        db_index=True # Added for performance as suggested
     )
     email = models.EmailField(
         _('email address'),
@@ -119,7 +155,8 @@ class User(AbstractUser):
         max_length=100,
         choices=INDUSTRY_CHOICES,
         blank=True,
-        null=True
+        null=True,
+        db_index=True # Added for potential filtering
     )
     other_industry_details = models.CharField(
         _("Other Industry Details"),
@@ -134,7 +171,7 @@ class User(AbstractUser):
     whatsapp_number = models.CharField(
         _("WhatsApp Number (with country code)"),
         max_length=20,
-        unique=True,
+        unique=True, # Ensures uniqueness at DB level
         blank=True,
         null=True,
         db_index=True # Added for performance
@@ -148,7 +185,8 @@ class User(AbstractUser):
         _("Preferred Language"),
         max_length=10,
         choices=LANGUAGE_CHOICES,
-        default='en'
+        default='en',
+        db_index=True # Added for potential filtering
     )
     preferred_currency = models.CharField(
         _("Preferred Currency"),
@@ -167,18 +205,34 @@ class User(AbstractUser):
     )
     uplas_xp_points = models.PositiveIntegerField(_("Uplas XP Points"), default=0)
 
-    is_premium_subscriber = models.BooleanField(_("Is Premium Subscriber"), default=False)
+    # Denormalized field: Updated by payments app (webhooks/signals)
+    is_premium_subscriber = models.BooleanField(
+        _("Is Premium Subscriber"),
+        default=False,
+        db_index=True, # Added for performance
+        help_text=_("Denormalized field. Single source of truth is the UserSubscription model.")
+    )
     
-    country = models.CharField(_("Country"), max_length=100, blank=True, null=True)
+    country = models.CharField(_("Country"), max_length=100, blank=True, null=True, db_index=True)
     city = models.CharField(_("City"), max_length=100, blank=True, null=True)
 
-    stripe_customer_id = models.CharField(max_length=255, blank=True, null=True, help_text=_("Stripe Customer ID, managed by the payments system."), db_index=True)
+    # Stripe Customer ID can live directly on User model if UserProfile is not always guaranteed
+    # or for simplification. This seems to be the case here based on original feedback.
+    stripe_customer_id = models.CharField(
+        max_length=255, blank=True, null=True,
+        help_text=_("Stripe Customer ID, managed by the payments system."),
+        db_index=True # Added for performance
+    )
 
+    # Timestamps from AbstractUser: date_joined, last_login
+    # Explicit timestamps for record creation/update if BaseModel is not used by User directly.
     created_at = models.DateTimeField(auto_now_add=True, editable=False, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True, editable=False, null=True, blank=True)
 
 
     USERNAME_FIELD = 'email'
+    # Username is still in REQUIRED_FIELDS because AbstractUser includes it.
+    # If username were not used at all (even for admin), one might create a custom AbstractBaseUser.
     REQUIRED_FIELDS = ['username'] 
 
     objects = UserManager()
@@ -190,27 +244,31 @@ class User(AbstractUser):
 
 
     def save(self, *args, **kwargs):
+        # Populate full_name from first_name and last_name if not set
         if not self.full_name and (self.first_name or self.last_name):
             self.full_name = f"{self.first_name or ''} {self.last_name or ''}".strip()
         
-        if not self.username and self.email: # Ensure username is populated if created outside custom manager
-            email_prefix = self.email.split('@')[0].replace('.', '_').replace('-', '_')[:130]
-            self.username = User.objects._generate_unique_username(email_prefix) # Use manager's method
-
+        # Ensure username is populated if created outside custom manager and is empty
+        # This is a fallback; UserManager should ideally handle all user creations.
+        if not self.username and self.email:
+            email_prefix = self.email.split('@')[0]
+            # Use the manager's method to generate username to ensure consistency and uniqueness logic
+            self.username = User.objects._generate_unique_username(email_prefix)
+            
         super().save(*args, **kwargs)
 
     def __str__(self):
         return self.email
         
     def generate_whatsapp_code(self):
-        """Generates a 6-digit verification code for WhatsApp."""
+        """Generates a 6-digit verification code for WhatsApp and saves it."""
         self.whatsapp_verification_code = str(random.randint(100000, 999999))
         self.whatsapp_code_created_at = timezone.now()
         self.save(update_fields=['whatsapp_verification_code', 'whatsapp_code_created_at'])
         return self.whatsapp_verification_code
 
 
-class UserProfile(BaseModel): 
+class UserProfile(BaseModel): # Inherits UUID id, created_at, updated_at from BaseModel
     """
     Stores additional profile information related to a User.
     Linked OneToOne with the User model.
@@ -223,10 +281,11 @@ class UserProfile(BaseModel):
     )
     bio = models.TextField(_("Short Bio / Professional Summary"), blank=True, null=True)
     
-    linkedin_url = models.URLField(_("LinkedIn Profile URL"), blank=True, null=True)
-    github_url = models.URLField(_("GitHub Profile URL"), blank=True, null=True)
-    website_url = models.URLField(_("Personal Website/Portfolio URL"), blank=True, null=True)
+    linkedin_url = models.URLField(_("LinkedIn Profile URL"), blank=True, null=True, max_length=500)
+    github_url = models.URLField(_("GitHub Profile URL"), blank=True, null=True, max_length=500)
+    website_url = models.URLField(_("Personal Website/Portfolio URL"), blank=True, null=True, max_length=500)
 
+    # AI Personalization Preferences
     preferred_tutor_persona = models.CharField(
         _("Preferred AI Tutor Persona"), max_length=50, blank=True, null=True,
         help_text=_("e.g., Formal, Friendly, Technical, Socratic, Humorous")
@@ -237,18 +296,18 @@ class UserProfile(BaseModel):
     )
     preferred_ttv_instructor = models.CharField(
         _("Preferred TTV Instructor"), max_length=20,
-        choices=[('uncle_trevor', _('Uncle Trevor')), ('susan', _('Susan'))], 
+        choices=[('uncle_trevor', _('Uncle Trevor')), ('susan', _('Susan'))], # Example choices
         blank=True, null=True
     )
     learning_style_preference = models.JSONField(
         _("Learning Style Preferences (e.g., VARK)"), blank=True, null=True, default=dict,
         help_text=_("Example: {'visual': 0.7, 'auditory': 0.5, 'kinesthetic': 0.3, 'reading_writing': 0.6}")
     )
-    areas_of_interest = models.JSONField( 
+    areas_of_interest = models.JSONField( # Consider ManyToMany to a Tag/Skill model if these become structured
         _("Specific Areas of Interest for Learning"), blank=True, null=True, default=list,
         help_text=_("List of topics or fields, e.g., ['NLP', 'Computer Vision', 'Web Security']")
     )
-    current_knowledge_level = models.JSONField( 
+    current_knowledge_level = models.JSONField( # Similarly, could be structured with a Skill model
         _("Self-Assessed Knowledge Levels per Topic/Skill"), blank=True, null=True, default=dict,
         help_text=_("Example: {'python-basics': 'Advanced', 'ml-intro': 'Beginner', 'api-design': 'Intermediate'}")
     )
@@ -258,9 +317,12 @@ class UserProfile(BaseModel):
         help_text=_("What the user wants to achieve on the platform.")
     )
 
+    # Timestamps (created_at, updated_at) are inherited from BaseModel
+
     class Meta:
         verbose_name = _('User Profile')
         verbose_name_plural = _('User Profiles')
+        ordering = ['-user__date_joined'] # Order by when the associated user joined
 
     def __str__(self):
         return f"{self.user.email}'s Profile"
@@ -270,11 +332,23 @@ class UserProfile(BaseModel):
 def create_or_update_user_profile_receiver(sender, instance, created, **kwargs):
     """
     Ensures a UserProfile exists for every User.
+    If the User model is updated, this signal also attempts to save the profile,
+    which can be useful if UserProfile has denormalized fields from User.
     """
     if created:
         UserProfile.objects.create(user=instance)
     else:
+        # Ensure profile exists and save it (e.g., if User model fields trigger profile updates)
+        # Using try-except for robustness, though profile should ideally always exist for existing users.
         try:
-            instance.profile.save() 
-        except UserProfile.DoesNotExist:
+            # instance.profile.save() # This would be if UserProfile needs to update itself based on User save
+            # For now, just ensure it exists
+            if not hasattr(instance, 'profile'):
+                 UserProfile.objects.create(user=instance)
+            else:
+                # If you had logic where UserProfile denormalizes User fields,
+                # you might want to update and save instance.profile here.
+                # For now, the primary goal is creation on user creation.
+                pass
+        except UserProfile.DoesNotExist: # Should not happen if created=False and signal worked on creation
             UserProfile.objects.create(user=instance)
