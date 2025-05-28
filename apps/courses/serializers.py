@@ -463,3 +463,168 @@ class UserTopicAttemptAnswerSerializer(serializers.ModelSerializer):
         allow_empty=True # Allow submitting empty list if no choice selected (though might be invalid for some Q types)
     )
     # Add fields for other answer types if needed (e.g., text_answer for fill-in-the-blank)
+
+    class Meta:
+        model = UserTopicAttemptAnswer
+        fields = ['question_id', 'selected_choice_ids'] # Add other answer fields if any
+        # This serializer is primarily for *writing* answers during quiz submission.
+        # For *reading* results, more detail might be shown (question text, choice text, correctness).
+
+class QuizSubmissionSerializer(serializers.Serializer):
+    topic_id = serializers.UUIDField()
+    answers = UserTopicAttemptAnswerSerializer(many=True)
+
+    def validate_topic_id(self, value):
+        try:
+            topic = Topic.objects.get(pk=value)
+        except Topic.DoesNotExist:
+            raise serializers.ValidationError(_("Invalid Topic ID."))
+        
+        user = self.context['request'].user
+        if not (user.is_staff or topic.module.course.instructor == user):
+            if not Enrollment.objects.filter(user=user, course=topic.module.course).exists():
+                 raise serializers.ValidationError(_("You must be enrolled in the course to submit this quiz."))
+        
+        self.context['topic_instance'] = topic # Pass topic instance for further validation
+        return value # Return the UUID
+
+    def validate_answers(self, submitted_answers_data):
+        if not submitted_answers_data:
+            raise serializers.ValidationError(_("Answers list cannot be empty."))
+        
+        topic = self.context.get('topic_instance')
+        if not topic: # Should be set by validate_topic_id
+            raise serializers.ValidationError(_("Topic context missing for answer validation."))
+
+        questions_in_topic = Question.objects.filter(topic=topic)
+        question_ids_in_topic_set = {str(q.id) for q in questions_in_topic}
+        
+        submitted_question_ids = set()
+        for answer_data in submitted_answers_data:
+            question_instance = answer_data.get('question') # This is Question instance after field validation
+            if not question_instance: # Should be caught by UserTopicAttemptAnswerSerializer
+                raise serializers.ValidationError(_("Invalid question data in submission."))
+
+            if str(question_instance.id) not in question_ids_in_topic_set:
+                raise serializers.ValidationError(
+                    {f"question_{question_instance.id}": _("Submitted question does not belong to this topic.")}
+                )
+            if str(question_instance.id) in submitted_question_ids:
+                raise serializers.ValidationError(
+                    {f"question_{question_instance.id}": _("Duplicate answer submitted for the same question.")}
+                )
+            submitted_question_ids.add(str(question_instance.id))
+            
+            # Validate choices belong to the question
+            selected_choices = answer_data.get('selected_choice_ids', []) # These are Choice instances
+            for choice_instance in selected_choices:
+                if choice_instance.question != question_instance:
+                    raise serializers.ValidationError(
+                        {f"choice_{choice_instance.id}": _(f"Choice '{choice_instance.text}' does not belong to question '{question_instance.text}'.")}
+                    )
+            
+            # Validate number of choices for single-choice
+            if question_instance.question_type == 'single-choice' and len(selected_choices) > 1:
+                raise serializers.ValidationError(
+                    {f"question_{question_instance.id}": _("Multiple choices selected for a single-choice question.")}
+                )
+        
+        # Optionally, check if all questions in the topic were answered
+        # if len(submitted_question_ids) != len(question_ids_in_topic_set):
+        #     raise serializers.ValidationError(_("Not all questions in the topic were answered."))
+            
+        return submitted_answers_data
+
+    @transaction.atomic
+    def create(self, validated_data):
+        user = self.context['request'].user
+        topic = self.context['topic_instance'] # From validate_topic_id
+        answers_data_list = validated_data['answers'] # This list now contains Question and Choice instances
+
+        questions_in_topic = Question.objects.filter(topic=topic).prefetch_related('choices')
+        total_questions_in_topic_count = questions_in_topic.count()
+        correct_answers_count = 0
+
+        quiz_attempt = QuizAttempt.objects.create(
+            user=user,
+            topic=topic,
+            score=0, 
+            correct_answers=0, 
+            total_questions_in_topic=total_questions_in_topic_count
+        )
+
+        for answer_dict in answers_data_list:
+            question_instance = answer_dict['question'] # This is a Question model instance
+            selected_choices_instances = answer_dict.get('selected_choice_ids', []) # List of Choice model instances
+            
+            is_answer_correct_for_question = False
+            if question_instance.question_type == 'single-choice':
+                correct_choice = question_instance.choices.filter(is_correct=True).first()
+                if correct_choice and selected_choices_instances and correct_choice == selected_choices_instances[0]:
+                    is_answer_correct_for_question = True
+            elif question_instance.question_type == 'multiple-choice':
+                correct_choice_ids_set = set(question_instance.choices.filter(is_correct=True).values_list('id', flat=True))
+                selected_choice_ids_set = {choice.id for choice in selected_choices_instances}
+                # Strict multiple choice: all correct choices selected and no incorrect choices selected.
+                if correct_choice_ids_set == selected_choice_ids_set:
+                    is_answer_correct_for_question = True
+            
+            if is_answer_correct_for_question:
+                correct_answers_count += 1
+
+            user_answer_obj = UserTopicAttemptAnswer.objects.create(
+                quiz_attempt=quiz_attempt,
+                question=question_instance,
+                is_correct=is_answer_correct_for_question
+            )
+            if selected_choices_instances:
+                user_answer_obj.selected_choices.set(selected_choices_instances)
+        
+        quiz_attempt.correct_answers = correct_answers_count
+        quiz_attempt.score = (correct_answers_count / total_questions_in_topic_count) * 100 if total_questions_in_topic_count > 0 else 0
+        
+        # Ensure TopicProgress exists and link it
+        topic_progress, _ = TopicProgress.objects.get_or_create(
+            user=user, 
+            topic=topic,
+            defaults={
+                'course_progress': CourseProgress.objects.filter(user=user, course=topic.module.course).first()
+            }
+        )
+        quiz_attempt.topic_progress = topic_progress
+        quiz_attempt.save()
+        
+        # Optionally, mark topic as complete if quiz score meets a threshold
+        # e.g., if quiz_attempt.score >= settings.QUIZ_PASS_THRESHOLD:
+        #    topic_progress.is_completed = True
+        #    topic_progress.save() # This would trigger CourseProgress update via signal
+
+        return quiz_attempt
+
+class QuizAttemptResultUserAnswerSerializer(serializers.ModelSerializer):
+    question_text = serializers.CharField(source='question.text', read_only=True)
+    question_explanation = serializers.CharField(source='question.explanation', read_only=True, allow_null=True)
+    selected_choices_details = ChoiceSerializer(source='selected_choices', many=True, read_only=True)
+    correct_choices_details = serializers.SerializerMethodField()
+
+    class Meta:
+        model = UserTopicAttemptAnswer
+        fields = ['id', 'question_id', 'question_text', 'question_explanation', 
+                  'selected_choices_details', 'correct_choices_details', 'is_correct']
+
+    def get_correct_choices_details(self, obj):
+        return ChoiceSerializer(obj.question.choices.filter(is_correct=True), many=True).data
+
+
+class QuizAttemptResultSerializer(serializers.ModelSerializer):
+    topic = TopicListSerializer(read_only=True)
+    user_answers = QuizAttemptResultUserAnswerSerializer(many=True, read_only=True, source='answers')
+    # `questions_with_details` could be redundant if user_answers provides enough detail.
+    # If still needed, ensure it doesn't cause N+1 or fetches efficiently.
+
+    class Meta:
+        model = QuizAttempt
+        fields = [
+            'id', 'user_id', 'topic', 'score', 'correct_answers',
+            'total_questions_in_topic', 'submitted_at', 'user_answers'
+        ]
