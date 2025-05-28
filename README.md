@@ -20,7 +20,7 @@ The UPLAS platform aims to provide a comprehensive e-learning experience with fe
 -   **Database:** Cloud SQL for MySQL (on GCP)
 -   **Authentication:** JWT (SimpleJWT)
 -   **Deployment:** Google Cloud Platform (e.g., Cloud Run or App Engine)
--   **External AI Services:** Separate repository `uplas-ai-agents` handles AI logic. This backend acts as an API client.
+-   **External AI Services:** Separate repository `uplas-ai-services` handles AI logic. This backend acts as an API client.
 
 ## Setup and Installation (Conceptual for Cloud Development)
 
