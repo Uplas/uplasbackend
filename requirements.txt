@@ -1,5 +1,3 @@
-# requirements.txt
-
 # --- Core Django & DRF ---
 Django>=4.2,<5.0
 djangorestframework>=3.14,<3.16
@@ -9,13 +7,13 @@ django-filter>=24.1,<25.0
 mysqlclient>=2.2,<2.3 # For MySQL connection
 python-dotenv>=1.0,<1.1 # For .env file handling
 gunicorn>=21.2,<22.1 # WSGI server for production
+requests>=2.31.0,<2.33.0 # ADDED: For making HTTP requests to AI services
 
 # --- Google Cloud Platform ---
 django-storages[google]>=1.14,<1.15
 google-cloud-storage>=2.16,<2.17
 # google-cloud-sql-python-connector[mysql-psycopg2]>=1.7,<1.8 # Optional: If connecting from outside GCP / specific setups
-# google-cloud-logging>=3.9,<3.10 # Optional: For direct GCP Logging integration
-
+# google-cloud-logging>=3.9,<3.10
 # --- Utilities ---
 requests>=2.31,<2.33 # For making HTTP requests to AI services
 Pillow>=10.2,<10.3 # For ImageField support
