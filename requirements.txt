@@ -8,6 +8,7 @@ mysqlclient>=2.2,<2.3 # For MySQL connection
 python-dotenv>=1.0,<1.1 # For .env file handling
 gunicorn>=21.2,<22.1 # WSGI server for production
 requests>=2.31.0,<2.33.0 # ADDED: For making HTTP requests to AI services
+whitenoise>=6.0,<7.0
 
 # --- Google Cloud Platform ---
 django-storages[google]>=1.14,<1.15
