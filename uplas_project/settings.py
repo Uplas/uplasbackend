@@ -38,7 +38,9 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     'django_filters',
-    # 'storages', # Added conditionally below
+    'storages', # Ensure 'storages' is always in INSTALLED_APPS when using GCS
+    'whitenoise.runserver_nostatic', # For development with WhiteNoise (optional)
+    'whitenoise', # Required for WhiteNoise production serving
 
     # Your apps
     'apps.core.apps.CoreConfig',
@@ -53,6 +55,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # WhiteNoiseMiddleware should be placed directly after Django's SecurityMiddleware
+    'whitenoise.middleware.WhiteNoiseMiddleware', # ADDED/MOVED for static file serving
     'corsheaders.middleware.CorsMiddleware', # Needs to be high up, esp. before CommonMiddleware
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.locale.LocaleMiddleware',
@@ -129,21 +133,58 @@ USE_L10N = True
 USE_TZ = True
 
 # --- Static & Media Files ---
+# IMPORTANT: Since GCS bucket is not public, Django will serve these files.
+# STATIC_URL and MEDIA_URL should be relative paths.
 STATIC_URL = '/static/'
 MEDIA_URL = '/media/'
+
 GS_BUCKET_NAME = os.environ.get('GS_BUCKET_NAME')
 
 if not DEBUG and GS_BUCKET_NAME:
-    if 'storages' not in INSTALLED_APPS: INSTALLED_APPS.append('storages')
+    # 'storages' app should be in INSTALLED_APPS unconditionally when used in production
+    # or ensure it's explicitly added if not already. Moved 'storages' to the main list.
+    # We still want to use GCS as the storage backend, even if Django serves them.
     STORAGES = {
-        "default": {"BACKEND": "storages.backends.gcloud.GoogleCloudStorage", "OPTIONS": {"bucket_name": GS_BUCKET_NAME, "location": "media"}},
-        "staticfiles": {"BACKEND": "storages.backends.gcloud.GoogleCloudStorage", "OPTIONS": {"bucket_name": GS_BUCKET_NAME, "location": "static"}},
+        "default": {
+            "BACKEND": "storages.backends.gcloud.GoogleCloudStorage",
+            "OPTIONS": {
+                "bucket_name": GS_BUCKET_NAME,
+                "location": "media",
+                "default_acl": "projectPrivate", # Ensure files are not publicly accessible by default
+            }
+        },
+        "staticfiles": {
+            "BACKEND": "storages.backends.gcloud.GoogleCloudStorage",
+            "OPTIONS": {
+                "bucket_name": GS_BUCKET_NAME,
+                "location": "static",
+                "default_acl": "projectPrivate", # Ensure files are not publicly accessible by default
+            }
+        },
     }
-    STATIC_URL = f'https://storage.googleapis.com/{GS_BUCKET_NAME}/static/'
-    MEDIA_URL = f'https://storage.googleapis.com/{GS_BUCKET_NAME}/media/'
+    # When serving via Django + WhiteNoise, STATIC_ROOT is where collectstatic will place files
+    # before WhiteNoise serves them (or before django-storages pushes them to GCS).
+    # WhiteNoise will then handle serving from this location (or directly from GCS via Django-storages
+    # for media, and also for static if WhiteNoise is configured for that).
+    STATIC_ROOT = BASE_DIR / 'staticfiles_collected' # Define a path for collected static files
+    # WhiteNoise will serve from this STATIC_ROOT.
+    # Django-storages will handle MEDIA_ROOT for media files.
+    MEDIA_ROOT = BASE_DIR / 'mediafiles_dev' # This path is for dev, but in prod, files go to GCS
+
+    # WhiteNoise configuration for production.
+    # It will automatically find files in STATIC_ROOT.
+    # Note: Ensure `collectstatic` is run during your build process.
+    # To use WhiteNoise, ensure `STATIC_ROOT` is properly defined for collectstatic.
+    # WhiteNoise serves files directly from STATIC_ROOT.
+    #
+    # Important: The URLs below are now relative, letting Django handle them.
+    # The GCS backend still *stores* the files, but the server pulls them.
+    # STATIC_URL and MEDIA_URL remain relative so your Django app can handle routing.
 else:
+    # If DEBUG is True or GS_BUCKET_NAME is not set, use local file paths
     STATIC_ROOT = BASE_DIR / 'staticfiles_collected'
     MEDIA_ROOT = BASE_DIR / 'mediafiles_dev'
+
 
 # --- Defaults & Custom User Model ---
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
