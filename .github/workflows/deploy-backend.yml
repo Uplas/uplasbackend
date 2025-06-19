@@ -1,0 +1,64 @@
+name: Deploy Uplas Backend to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  PROJECT_ID: 'cs-poc-w8pykuyg0mptchb3jfkuhbw' # Your Google Cloud Project ID
+  GCP_REGION: 'us-central1' # Your Google Cloud region for services
+  SERVICE_ACCOUNT_EMAIL: 'github-actions-deployer@cs-poc-w8pykuyg0mptchb3jfkuhbw.iam.gserviceaccount.com' # Your GitHub Actions deployer service account
+  WORKLOAD_IDENTITY_PROVIDER: 'projects/772221283576/locations/global/workloadIdentityPools/github-pool/providers/github-provider' # Full resource name of your Workload Identity Provider
+  ARTIFACT_REGISTRY_REPO: 'uplas-images' # Name of your Artifact Registry repo
+  CLOUD_RUN_SERVICE_NAME: 'uplas-me-backend-service' # Name for your Cloud Run service
+  IMAGE_NAME: 'uplas.me-backend' # Name of the Docker image within your Artifact Registry repo
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write' # Required for Workload Identity Federation
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: 'auth'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GCP_REGION }}-docker.pkg.dev
+          username: _json_key
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          context: . # Assumes Dockerfile is in the root of your repository
+          file: ./Dockerfile # Path to your Dockerfile
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.CLOUD_RUN_SERVICE_NAME }}
+          image: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          region: ${{ env.GCP_REGION }}
+          # Uncomment and configure if your Cloud Run service needs public access or specific environment variables
+          # flags: --allow-unauthenticated # If your service is public
+          # env_vars: | # Example for environment variables
+          #   DJANGO_SETTINGS_MODULE=uplas_project.settings.production
+          #   DATABASE_URL=${{ secrets.DATABASE_URL_SECRET }} # Example secret from GitHub Secrets or GCP Secret Manager
