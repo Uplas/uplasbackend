@@ -24,32 +24,32 @@ jobs:
         ports:
           - 3306:3306 # Map container port to host port (for the runner)
         options: >-
-          --health-cmd="mysqladmin ping" 
-          --health-interval=10s 
-          --health-timeout=5s 
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
           --health-retries=3
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4 # Updated to v4
+      uses: actions/checkout@v4
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4 # Updated to v4
+      uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
-        cache: 'pip' # Keep this for caching pip dependencies
+        cache: 'pip' # Cache pip dependencies
 
     - name: Install System Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y default-libmysqlclient-dev gcc python3-dev # Ensure mysqlclient build tools
+        sudo apt-get install -y default-libmysqlclient-dev gcc python3-dev # For mysqlclient
 
     - name: Install Python Dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run Django Tests with MySQL
+    - name: Run Django Tests
       env:
         # --- Essential ---
         SECRET_KEY: ${{ secrets.DJANGO_TEST_SECRET_KEY }}
@@ -70,10 +70,10 @@ jobs:
         AI_PROJECT_GENERATOR_SERVICE_URL: "http://dummy.url"
         AI_PROJECT_ASSESSMENT_SERVICE_URL: "http://dummy.url"
         AI_SERVICE_API_KEY: "dummy_ai_key"
-        GS_BUCKET_NAME: "dummy-test-bucket" # Required if django-storages is always used
-
+        GS_BUCKET_NAME: "dummy-test-bucket"
       run: |
-        sleep 10
-        python manage.py makemigrations --noinput s
+        echo "Waiting for MySQL service to be ready..."
+        sleep 15 # Give the service a bit more time to initialize
+        echo "Running Migrations and Tests..."
         python manage.py migrate --noinput
         python manage.py test
