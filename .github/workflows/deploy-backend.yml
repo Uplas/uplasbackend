@@ -3,14 +3,14 @@ name: Deploy Uplas Backend to Cloud Run
 on:
   push:
     branches:
-      - main
+      - main # Triggers on pushes to the main branch
 
 env:
   PROJECT_ID: 'cs-poc-w8pykuyg0mptchb3jfkuhbw' # Your Google Cloud Project ID
-  GCP_REGION: 'us-central1' # Your Google Cloud region for services
-  SERVICE_ACCOUNT_EMAIL: 'github-actions-deployer@cs-poc-w8pykuyg0mptchb3jfkuhbw.iam.gserviceaccount.com' # Your GitHub Actions deployer service account
+  GCP_REGION: 'us-central1' # Your Google Cloud region for services (e.g., us-central1)
+  SERVICE_ACCOUNT_EMAIL: 'github-actions-deployer@cs-poc-w8pykuyg0mptchb3jfkuhbw.iam.gserviceaccount.com' # Your GitHub Actions deployer service account email
   WORKLOAD_IDENTITY_PROVIDER: 'projects/772221283576/locations/global/workloadIdentityPools/github-pool/providers/github-provider' # Full resource name of your Workload Identity Provider
-  ARTIFACT_REGISTRY_REPO: 'uplas-images' # Name of your Artifact Registry repo
+  ARTIFACT_REGISTRY_REPO: 'uplas-images' # Name of your Artifact Registry repository
   CLOUD_RUN_SERVICE_NAME: 'uplas-me-backend-service' # Name for your Cloud Run service
   IMAGE_NAME: 'uplas.me-backend' # Name of the Docker image within your Artifact Registry repo
 
@@ -23,28 +23,28 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4 # Updated to v4
 
       - name: Authenticate to Google Cloud
         id: 'auth'
-        uses: 'google-github-actions/auth@v2' # UPDATED to v2
+        uses: 'google-github-actions/auth@v2' # Updated to v2
         with:
           project_id: ${{ env.PROJECT_ID }}
           workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ env.SERVICE_ACCOUNT_EMAIL }}
 
-      - name: Set up Docker
-        uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3 # Current stable v3
 
       - name: Login to Artifact Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v3 # Current stable v3
         with:
           registry: ${{ env.GCP_REGION }}-docker.pkg.dev
           username: _json_key
           password: ${{ steps.auth.outputs.access_token }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v5 # Current stable v5
         with:
           push: true
           tags: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
@@ -52,13 +52,52 @@ jobs:
           file: ./Dockerfile # Path to your Dockerfile
 
       - name: Deploy to Cloud Run
-        uses: google-github-actions/deploy-cloudrun@v2' # UPDATED to v2
+        uses: google-github-actions/deploy-cloudrun@v2 # Updated to v2
         with:
           service: ${{ env.CLOUD_RUN_SERVICE_NAME }}
           image: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           region: ${{ env.GCP_REGION }}
-          # Uncomment and configure if your Cloud Run service needs public access or specific environment variables
-          # flags: --allow-unauthenticated # If your service is public
-          # env_vars: | # Example for environment variables
-          #   DJANGO_SETTINGS_MODULE=uplas_project.settings.production
-          #   DATABASE_URL=${{ secrets.DATABASE_URL_SECRET }} # Example secret from GitHub Secrets or GCP Secret Manager
+          flags: |
+            --allow-unauthenticated
+            --set-cloudsql-instances=${{ env.INSTANCE_CONNECTION_NAME }}
+            --no-cpu-throttling
+            --min-instances=1 # Keep at least one instance running to reduce cold starts
+            --max-instances=5 # Adjust based on expected load
+            --memory=512Mi # Adjust based on your application's memory needs
+            --cpu=1 # Adjust based on your application's CPU needs
+          env_vars: |
+            # --- Django Core Settings ---
+            DJANGO_SETTINGS_MODULE=uplas_project.settings # Assumes production settings are handled in settings.py 
+            DJANGO_SECRET_KEY=${{ secrets.DJANGO_PROD_SECRET_KEY }}
+            DJANGO_ALLOWED_HOSTS=${{ secrets.DJANGO_PROD_ALLOWED_HOSTS }}
+            DJANGO_DEBUG=False
+            
+            # --- Database Settings (Cloud SQL) ---
+            DB_ENGINE=django.db.backends.mysql # Confirm this if you use a different one
+            DB_NAME=${{ secrets.PROD_DB_NAME }}
+            DB_USER=${{ secrets.PROD_DB_USER }}
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}
+            DB_HOST=/cloudsql/${{ env.INSTANCE_CONNECTION_NAME }} # Standard for Cloud Run to Cloud SQL
+
+            # --- Google Cloud Storage (for static/media files) ---
+            GS_BUCKET_NAME=${{ secrets.GS_PROD_BUCKET_NAME }}
+            GS_IS_PUBLIC=${{ secrets.GS_IS_PUBLIC }} # Set to "True" or "False" as needed
+
+            # --- Stripe Settings ---
+            STRIPE_SECRET_KEY=${{ secrets.STRIPE_PROD_SECRET_KEY }}
+            STRIPE_WEBHOOK_SECRET=${{ secrets.STRIPE_WEBHOOK_SECRET }}
+
+            # --- AI Service URLs (from uplas-ai-agents deployment) ---
+            AI_NLP_TUTOR_SERVICE_URL=${{ secrets.AI_NLP_TUTOR_SERVICE_URL }}
+            AI_TTS_SERVICE_URL=${{ secrets.AI_TTS_SERVICE_URL }}
+            AI_TTV_SERVICE_URL=${{ secrets.AI_TTV_SERVICE_URL }}
+            AI_PROJECT_GENERATOR_SERVICE_URL=${{ secrets.AI_PROJECT_GENERATOR_SERVICE_URL }}
+            AI_PROJECT_ASSESSMENT_SERVICE_URL=${{ secrets.AI_PROJECT_ASSESSMENT_SERVICE_URL }}
+            AI_SERVICE_API_KEY=${{ secrets.AI_SERVICE_API_KEY }}
+
+            # --- Custom Settings ---
+            # Add any other environment variables your Django app requires in production
+            # e.g., for third-party services, logging, etc.
+
+      - name: Show Deployed URL
+        run: echo "Service deployed to ${{ steps.deploy.outputs.url }}"
