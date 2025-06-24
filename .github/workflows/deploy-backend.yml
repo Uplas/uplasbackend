@@ -3,7 +3,7 @@ name: Deploy Uplas Backend to Cloud Run
 on:
   push:
     branches:
-      - main # Triggers on pushes to the main branch
+      - main
 
 env:
   PROJECT_ID: 'cs-poc-w8pykuyg0mptchb3jfkuhbw'
@@ -13,7 +13,6 @@ env:
   ARTIFACT_REGISTRY_REPO: 'uplas-images'
   CLOUD_RUN_SERVICE_NAME: 'uplas-me-backend-service'
   IMAGE_NAME: 'uplas.me-backend'
-  INSTANCE_CONNECTION_NAME: ${{ secrets.INSTANCE_CONNECTION_NAME }} # <-- CRITICAL FIX: Added this
 
 jobs:
   deploy:
@@ -30,7 +29,6 @@ jobs:
         id: 'auth'
         uses: 'google-github-actions/auth@v2'
         with:
-          project_id: ${{ env.PROJECT_ID }}
           workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ env.SERVICE_ACCOUNT_EMAIL }}
 
@@ -41,7 +39,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.GCP_REGION }}-docker.pkg.dev
-          username: _json_key
+          username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
       - name: Build and push Docker image
@@ -54,71 +52,35 @@ jobs:
 
       - name: Deploy to Cloud Run
         id: deploy_service
-        uses: google-github-actions/deploy-cloudrun@v2
+        uses: 'google-github-actions/deploy-cloudrun@v2'
         with:
           service: ${{ env.CLOUD_RUN_SERVICE_NAME }}
-          image: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           region: ${{ env.GCP_REGION }}
-          flags: |
-            --allow-unauthenticated
-            --set-cloudsql-instances=${{ env.INSTANCE_CONNECTION_NAME }}
-            --no-cpu-throttling
-            --min-instances=1
-            --max-instances=5
-            --memory=512Mi
-            --cpu=1
-          env_vars: |
-            DJANGO_SETTINGS_MODULE=uplas_project.settings
-            DJANGO_SECRET_KEY=${{ secrets.DJANGO_PROD_SECRET_KEY }}
-            DJANGO_ALLOWED_HOSTS=${{ secrets.DJANGO_PROD_ALLOWED_HOSTS }}
-            DJANGO_DEBUG=False
-            DB_ENGINE=django.db.backends.mysql
-            DB_NAME=${{ secrets.PROD_DB_NAME }}
-            DB_USER=${{ secrets.PROD_DB_USER }}
-            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}
-            DB_HOST=/cloudsql/${{ env.INSTANCE_CONNECTION_NAME }}
-            GS_BUCKET_NAME=${{ secrets.GS_PROD_BUCKET_NAME }}
-            GS_IS_PUBLIC=${{ secrets.GS_IS_PUBLIC }}
-            STRIPE_SECRET_KEY=${{ secrets.STRIPE_PROD_SECRET_KEY }}
-            STRIPE_WEBHOOK_SECRET=${{ secrets.STRIPE_WEBHOOK_SECRET }}
-            AI_NLP_TUTOR_SERVICE_URL=${{ secrets.AI_NLP_TUTOR_SERVICE_URL }}
-            AI_TTS_SERVICE_URL=${{ secrets.AI_TTS_SERVICE_URL }}
-            AI_TTV_SERVICE_URL=${{ secrets.AI_TTV_SERVICE_URL }}
-            AI_PROJECT_GENERATOR_SERVICE_URL=${{ secrets.AI_PROJECT_GENERATOR_SERVICE_URL }}
-            AI_PROJECT_ASSESSMENT_SERVICE_URL=${{ secrets.AI_PROJECT_ASSESSMENT_SERVICE_URL }}
-            AI_SERVICE_API_KEY=${{ secrets.AI_SERVICE_API_KEY }}
+          image: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          flags: '--cpu-boost --no-cpu-throttling --min-instances=1 --max-instances=3'
+          secrets:
+            # Format: GITHUB_SECRET_NAME=GCP_SECRET_NAME:VERSION
+            - DJANGO_PROD_SECRET_KEY=DJANGO_PROD_SECRET_KEY:latest
+            - DJANGO_PROD_ALLOWED_HOSTS=DJANGO_PROD_ALLOWED_HOSTS:latest
+            - PROD_DB_NAME=PROD_DB_NAME:latest
+            - PROD_DB_USER=PROD_DB_USER:latest
+            - PROD_DB_PASSWORD=PROD_DB_PASSWORD:latest
+            - INSTANCE_CONNECTION_NAME=INSTANCE_CONNECTION_NAME:latest
+            - GS_PROD_BUCKET_NAME=GS_PROD_BUCKET_NAME:latest
+            - STRIPE_PROD_SECRET_KEY=STRIPE_PROD_SECRET_KEY:latest
+            - STRIPE_WEBHOOK_SECRET=STRIPE_WEBHOOK_SECRET:latest
+            - AI_NLP_TUTOR_SERVICE_URL=AI_NLP_TUTOR_SERVICE_URL:latest
+            - AI_TTS_SERVICE_URL=AI_TTS_SERVICE_URL:latest
+            - AI_TTV_SERVICE_URL=AI_TTV_SERVICE_URL:latest
+            - AI_PROJECT_GENERATOR_SERVICE_URL=AI_PROJECT_GENERATOR_SERVICE_URL:latest
+            - AI_PROJECT_ASSESSMENT_SERVICE_URL=AI_PROJECT_ASSESSMENT_SERVICE_URL:latest
+            - AI_SERVICE_API_KEY=AI_SERVICE_API_KEY:latest
+          env_vars:
+            # Non-secret environment variables
+            - DJANGO_SETTINGS_MODULE=uplas_project.settings
+            - DJANGO_DEBUG=False
+            - DB_ENGINE=django.db.backends.mysql
+            - GS_IS_PUBLIC=False
 
       - name: Show Deployed URL
         run: echo "Service deployed to ${{ steps.deploy_service.outputs.url }}"
-
-  run-migrations:
-    needs: deploy
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: 'write'
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Authenticate to Google Cloud
-      id: 'auth'
-      uses: 'google-github-actions/auth@v2'
-      with:
-        project_id: ${{ env.PROJECT_ID }}
-        workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
-        service_account: ${{ env.SERVICE_ACCOUNT_EMAIL }}
-
-    - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v2
-
-    - name: Run Django Migrations on Cloud Run
-      run: |
-        gcloud run jobs execute ${{ env.CLOUD_RUN_SERVICE_NAME }}-migrations \
-          --region ${{ env.GCP_REGION }} \
-          --wait \
-          --update-env-vars="DJANGO_SETTINGS_MODULE=uplas_project.settings,DJANGO_SECRET_KEY=${{ secrets.DJANGO_PROD_SECRET_KEY }},DB_ENGINE=django.db.backends.mysql,DB_NAME=${{ secrets.PROD_DB_NAME }},DB_USER=${{ secrets.PROD_DB_USER }},DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }},DB_HOST=/cloudsql/${{ env.INSTANCE_CONNECTION_NAME }}" \
-          --task-timeout=600 \
-          --image ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-          --command "python" \
-          --args "manage.py","migrate","--noinput"

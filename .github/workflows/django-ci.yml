@@ -12,22 +12,21 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10"] # Focus on one primary version
+        python-version: ["3.11"] # ALIGNED with Dockerfile
 
-    # --- Add MySQL Service Container ---
     services:
       mysql:
-        image: mysql:8.0 # Use a specific MySQL version
+        image: mysql:8.0
         env:
-          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_TEST_ROOT_PASSWORD }} # ADD this secret
+          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_TEST_ROOT_PASSWORD }}
           MYSQL_DATABASE: test_uplas_db
         ports:
-          - 3306:3306 # Map container port to host port (for the runner)
+          - 3306:3306
         options: >-
-          --health-cmd="mysqladmin ping"
+          --health-cmd="mysqladmin ping -h 127.0.0.1 --silent"
           --health-interval=10s
           --health-timeout=5s
-          --health-retries=3
+          --health-retries=10
 
     steps:
     - name: Checkout code
@@ -37,12 +36,12 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
-        cache: 'pip' # Cache pip dependencies
+        cache: 'pip'
 
     - name: Install System Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y default-libmysqlclient-dev gcc python3-dev # For mysqlclient
+        sudo apt-get install -y default-libmysqlclient-dev gcc python3-dev
 
     - name: Install Python Dependencies
       run: |
@@ -57,12 +56,13 @@ jobs:
         # --- Use MySQL Service for CI Tests ---
         DB_ENGINE: "django.db.backends.mysql"
         DB_NAME: "test_uplas_db"
-        DB_USER: "root" # Use the root user for the test DB service
+        DB_USER: "root"
         DB_PASSWORD: ${{ secrets.MYSQL_TEST_ROOT_PASSWORD }}
-        DB_HOST: "127.0.0.1" # The service is mapped to the runner's localhost
+        DB_HOST: "127.0.0.1"
         DB_PORT: "3306"
         # --- Dummy variables ---
         DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1"
+        GS_BUCKET_NAME: "dummy-gcs-bucket"
         STRIPE_SECRET_KEY: "dummy_stripe_key"
         AI_NLP_TUTOR_SERVICE_URL: "http://dummy.url"
         AI_TTS_SERVICE_URL: "http://dummy.url"
@@ -70,10 +70,9 @@ jobs:
         AI_PROJECT_GENERATOR_SERVICE_URL: "http://dummy.url"
         AI_PROJECT_ASSESSMENT_SERVICE_URL: "http://dummy.url"
         AI_SERVICE_API_KEY: "dummy_ai_key"
-        GS_BUCKET_NAME: "dummy-test-bucket"
       run: |
-        echo "Waiting for MySQL service to be ready..."
-        sleep 15 # Give the service a bit more time to initialize
+        echo "Waiting for MySQL service..."
+        # The health check in the service definition handles waiting.
         echo "Running Migrations and Tests..."
         python manage.py migrate --noinput
-        python manage.py test
+        python manage.py test apps/
