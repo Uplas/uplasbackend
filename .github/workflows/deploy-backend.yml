@@ -1,3 +1,5 @@
+# Create the corrected deploy-backend.yml
+cat > .github/workflows/deploy-backend.yml << 'EOF'
 name: Deploy Uplas Backend to Cloud Run
 
 on:
@@ -65,25 +67,8 @@ jobs:
             --cpu=2 \
             --timeout=3600 \
             --set-cloudsql-instances=${{ env.CLOUD_SQL_INSTANCE }} \
-            --update-secrets=DJANGO_PROD_SECRET_KEY=DJANGO_PROD_SECRET_KEY:latest \
-            --update-secrets=DJANGO_PROD_ALLOWED_HOSTS=DJANGO_PROD_ALLOWED_HOSTS:latest \
-            --update-secrets=PROD_DB_NAME=PROD_DB_NAME:latest \
-            --update-secrets=PROD_DB_USER=PROD_DB_USER:latest \
-            --update-secrets=PROD_DB_PASSWORD=PROD_DB_PASSWORD:latest \
-            --update-secrets=INSTANCE_CONNECTION_NAME=INSTANCE_CONNECTION_NAME:latest \
-            --update-secrets=GS_PROD_BUCKET_NAME=GS_PROD_BUCKET_NAME:latest \
-            --update-secrets=STRIPE_PROD_SECRET_KEY=STRIPE_PROD_SECRET_KEY:latest \
-            --update-secrets=STRIPE_WEBHOOK_SECRET=STRIPE_WEBHOOK_SECRET:latest \
-            --update-secrets=AI_NLP_TUTOR_SERVICE_URL=AI_NLP_TUTOR_SERVICE_URL:latest \
-            --update-secrets=AI_TTS_SERVICE_URL=AI_TTS_SERVICE_URL:latest \
-            --update-secrets=AI_TTV_SERVICE_URL=AI_TTV_SERVICE_URL:latest \
-            --update-secrets=AI_PROJECT_GENERATOR_SERVICE_URL=AI_PROJECT_GENERATOR_SERVICE_URL:latest \
-            --update-secrets=AI_PROJECT_ASSESSMENT_SERVICE_URL=AI_PROJECT_ASSESSMENT_SERVICE_URL:latest \
-            --update-secrets=AI_SERVICE_API_KEY=AI_SERVICE_API_KEY:latest \
-            --update-env-vars=DJANGO_SETTINGS_MODULE=uplas_project.settings \
-            --update-env-vars=DJANGO_DEBUG=False \
-            --update-env-vars=DB_ENGINE=django.db.backends.mysql \
-            --update-env-vars=GS_IS_PUBLIC=False \
+            --update-secrets=DJANGO_PROD_SECRET_KEY=DJANGO_PROD_SECRET_KEY:latest,DJANGO_PROD_ALLOWED_HOSTS=DJANGO_PROD_ALLOWED_HOSTS:latest,PROD_DB_NAME=PROD_DB_NAME:latest,PROD_DB_USER=PROD_DB_USER:latest,PROD_DB_PASSWORD=PROD_DB_PASSWORD:latest,INSTANCE_CONNECTION_NAME=INSTANCE_CONNECTION_NAME:latest,GS_PROD_BUCKET_NAME=GS_PROD_BUCKET_NAME:latest,STRIPE_PROD_SECRET_KEY=STRIPE_PROD_SECRET_KEY:latest,STRIPE_WEBHOOK_SECRET=STRIPE_WEBHOOK_SECRET:latest,AI_NLP_TUTOR_SERVICE_URL=AI_NLP_TUTOR_SERVICE_URL:latest,AI_TTS_SERVICE_URL=AI_TTS_SERVICE_URL:latest,AI_TTV_SERVICE_URL=AI_TTV_SERVICE_URL:latest,AI_PROJECT_GENERATOR_SERVICE_URL=AI_PROJECT_GENERATOR_SERVICE_URL:latest,AI_PROJECT_ASSESSMENT_SERVICE_URL=AI_PROJECT_ASSESSMENT_SERVICE_URL:latest,AI_SERVICE_API_KEY=AI_SERVICE_API_KEY:latest \
+            --update-env-vars=DJANGO_SETTINGS_MODULE=uplas_project.settings,DJANGO_DEBUG=False,DB_ENGINE=django.db.backends.mysql,GS_IS_PUBLIC=False \
             --port=8080
 
       - name: Get Service URL
@@ -97,3 +82,4 @@ jobs:
           echo "✅ Deployment completed successfully!"
           echo "🌐 Service URL: $SERVICE_URL"
           echo "📦 Image: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+EOF
