@@ -100,8 +100,4 @@ jobs:
             # e.g., for third-party services, logging, etc.
 
       - name: Show Deployed URL
-HEAD
         run: echo "Service deployed to ${{ steps.deploy.outputs.url }}"
-
-        run: echo "Service deployed to ${{ steps.deploy.outputs.url }}"
-        20d7ab5b51a430b131b8f7f0fb7460202a252c89

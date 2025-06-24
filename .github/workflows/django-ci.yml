@@ -73,8 +73,7 @@ jobs:
         GS_BUCKET_NAME: "dummy-test-bucket" # Required if django-storages is always used
 
       run: |
-        # Wait a few seconds to ensure MySQL is fully ready (optional but can help)
         sleep 10
-        python manage.py makemigrations --noinput # Generate any pending migrations
-        python manage.py migrate --noinput # Apply migrations to the test DB
-        python manage.py test # Run ALL tests
+        python manage.py makemigrations --noinput s
+        python manage.py migrate --noinput
+        python manage.py test
