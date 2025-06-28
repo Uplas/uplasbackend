@@ -107,7 +107,7 @@ class SendWhatsAppVerificationView(APIView):
         user = request.user
         new_whatsapp_number = serializer.validated_data['whatsapp_number']
 
-        cooldown_minutes = getattr(settings, 'WHATSAPP_RESEND_COOLDOWN_MINUTES', 1)
+        cooldown_minutes = getattr(settings, 'WHATSAPP_RESEND_COOLDOWN_MINUTES', 10)
         if user.whatsapp_code_created_at and \
            timezone.now() < user.whatsapp_code_created_at + timedelta(minutes=cooldown_minutes):
             return Response(
