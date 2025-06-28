@@ -114,6 +114,7 @@ DATABASES = {
 INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME")
 if not DEBUG and INSTANCE_CONNECTION_NAME:
     DATABASES['default']['HOST'] = f'/cloudsql/{INSTANCE_CONNECTION_NAME}'
+    DATABASES['default']['PORT'] = ''  # Must be empty for Unix sockets
 
 # --- Password Validation ---
 AUTH_PASSWORD_VALIDATORS = [
