@@ -18,8 +18,8 @@ google-cloud-storage>=2.16,<2.17
 # --- Utilities ---
 requests>=2.31,<2.33 # For making HTTP requests to AI services
 Pillow>=10.2,<10.3 # For ImageField support
-# celery>=5.3,<5.4 # Uncomment if you add Celery for background tasks
-# redis>=5.0,<5.1 # Uncomment if using Redis for Celery/Caching
+celery>=5.3,<5.4 # Uncommented for background tasks
+redis>=5.0,<5.1 # Uncommented if using Redis for Celery/Caching
 
 # --- Stripe ---
 stripe>=8.5,<9.0
