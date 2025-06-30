@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
+from django.utils.translation import gettext_lazy as _ 
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(os.path.join(BASE_DIR, '.env'))
@@ -108,3 +110,16 @@ CORS_ALLOWED_ORIGINS = os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:8000,
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY')
 
 CURRENCY_CHOICES = [ ('USD', 'US Dollar'), ('KES', 'Kenyan Shilling'), ('NGN', 'Nigerian Naira'), ('GHS', 'Ghanaian Cedi') ]
+
+LANGUAGE_CHOICES = [
+    ('en', _('English')),
+    ('es', _('Spanish')),
+    ('fr', _('French')),
+    ('de', _('German')),
+    ('zh', _('Chinese')),
+    ('ja', _('Japanese')),
+    ('pt', _('Portuguese')),
+    ('ru', _('Russian')),
+    ('ar', _('Arabic')),
+    ('hi', _('Hindi')),
+]
