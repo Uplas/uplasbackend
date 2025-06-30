@@ -1,30 +1,16 @@
-# --- Core Django & DRF ---
+# Core Django & DRF
 Django>=4.2,<5.0
 djangorestframework>=3.14,<3.16
 djangorestframework-simplejwt>=5.3,<5.4
 django-cors-headers>=4.3,<4.4
+mysqlclient>=2.2,<2.3
+python-dotenv>=1.0,<1.1
+gunicorn>=21.2,<22.1
+
+# Filtering & Nested Routers
 django-filter>=24.1,<25.0
-mysqlclient>=2.2,<2.3 # For MySQL connection
-python-dotenv>=1.0,<1.1 # For .env file handling
-gunicorn>=21.2,<22.1 # WSGI server for production
-requests>=2.31.0,<2.33.0 # ADDED: For making HTTP requests to AI services
-whitenoise>=6.0,<7.0
+djangorestframework-nested>=0.93.4
 
-# --- Google Cloud Platform ---
-django-storages[google]>=1.14,<1.15
-google-cloud-storage>=2.16,<2.17
-# google-cloud-sql-python-connector[mysql-psycopg2]>=1.7,<1.8 # Optional: If connecting from outside GCP / specific setups
-# google-cloud-logging>=3.9,<3.10
-# --- Utilities ---
-requests>=2.31,<2.33 # For making HTTP requests to AI services
-Pillow>=10.2,<10.3 # For ImageField support
-celery>=5.3,<5.4 # Uncommented for background tasks
-redis>=5.0,<5.1 # Uncommented if using Redis for Celery/Caching
-
-# --- Stripe ---
-stripe>=8.5,<9.0
-
-# --- Development & Testing ---
-# pytest-django # Recommended for testing
-# black # Code formatter
-# ruff # Linter
+# Utilities & Services
+requests>=2.31.0,<2.33.0
+Pillow>=10.2,<10.3
