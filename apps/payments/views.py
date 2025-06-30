@@ -1,88 +1,96 @@
-# payments/views.py
-import hashlib
-import hmac
-import json
-from datetime import date, timedelta
+
+# apps/payments/views.py
 from django.conf import settings
-from django.http import HttpResponse
-from django.views.decorators.csrf import csrf_exempt
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework import viewsets, status
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from users.models import User
-from .models import Plan, Subscription, Payment
+from rest_framework.views import APIView
+from rest_framework.decorators import action
+import stripe
 
-@csrf_exempt
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def paystack_webhook(request):
+from .models import SubscriptionPlan, UserSubscription, PaymentTransaction
+from .serializers import SubscriptionPlanSerializer, UserSubscriptionSerializer, PaymentTransactionSerializer, CreateSubscriptionSerializer, CancelSubscriptionSerializer
+from apps.users.models import User # CORRECTED IMPORT
+
+stripe.api_key = settings.STRIPE_SECRET_KEY
+
+class SubscriptionPlanViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    Handles Paystack webhook events.
+    Lists available subscription plans.
     """
-    paystack_secret_key = settings.PAYSTACK_SECRET_KEY
-    if not paystack_secret_key:
-        return HttpResponse(status=500, content='Paystack secret key not configured.')
+    queryset = SubscriptionPlan.objects.filter(is_active=True)
+    serializer_class = SubscriptionPlanSerializer
+    permission_classes = [AllowAny]
 
-    # Verify the event by checking the signature
-    signature = request.headers.get('x-paystack-signature')
-    if not signature:
-        return HttpResponse(status=400, content='Missing signature header')
+class UserSubscriptionViewSet(viewsets.ModelViewSet):
+    """
+    Manages user subscriptions.
+    """
+    serializer_class = UserSubscriptionSerializer
+    permission_classes = [IsAuthenticated]
 
-    computed_signature = hmac.new(
-        paystack_secret_key.encode('utf-8'),
-        request.body,
-        hashlib.sha512
-    ).hexdigest()
+    def get_queryset(self):
+        return UserSubscription.objects.filter(user=self.request.user)
 
-    if signature != computed_signature:
-        return HttpResponse(status=400, content='Invalid signature')
-
-    # Process the event
-    try:
-        event = json.loads(request.body)
-    except json.JSONDecodeError:
-        return HttpResponse(status=400, content='Invalid JSON payload')
-
-    event_type = event.get('event')
-
-    if event_type == 'charge.success':
-        data = event.get('data')
-        email = data['customer']['email']
-        amount = data['amount'] / 100  # Amount is in kobo
-        reference = data['reference']
-
+    @action(detail=False, methods=['get'], url_path='my-subscription')
+    def my_subscription(self, request):
         try:
-            user = User.objects.get(email=email)
-        except User.DoesNotExist:
-            return HttpResponse(status=404, content=f'User with email {email} not found.')
+            subscription = UserSubscription.objects.get(user=request.user)
+            serializer = self.get_serializer(subscription)
+            return Response(serializer.data)
+        except UserSubscription.DoesNotExist:
+            return Response({'detail': 'No active subscription found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        # Find a plan that matches the amount paid
-        try:
-            plan = Plan.objects.get(price=amount)
-        except Plan.DoesNotExist:
-             return HttpResponse(status=404, content=f'No plan found for amount {amount}.')
+    @action(detail=False, methods=['post'], url_path='create-subscription')
+    def create_subscription(self, request):
+        serializer = CreateSubscriptionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        # Placeholder for Stripe creation logic
+        return Response({'detail': 'Subscription creation endpoint not fully implemented.'}, status=status.HTTP_501_NOT_IMPLEMENTED)
 
-        # Create or update subscription
-        subscription, created = Subscription.objects.update_or_create(
-            user=user,
-            defaults={
-                'plan': plan,
-                'start_date': date.today(),
-                'end_date': date.today() + timedelta(days=plan.duration_days),
-                'is_active': True,
-            }
-        )
+    @action(detail=True, methods=['post'], url_path='cancel-subscription')
+    def cancel_subscription(self, request, pk=None):
+        serializer = CancelSubscriptionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        # Placeholder for Stripe cancellation logic
+        return Response({'detail': 'Subscription cancellation endpoint not fully implemented.'}, status=status.HTTP_501_NOT_IMPLEMENTED)
+
+class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Lists payment transactions for the authenticated user.
+    """
+    serializer_class = PaymentTransactionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return PaymentTransaction.objects.filter(user=self.request.user)
+
+class StripeWebhookAPIView(APIView):
+    """
+    Handles webhooks from Stripe.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        payload = request.body
+        sig_header = request.META.get('HTTP_STRIPE_SIGNATURE')
+        endpoint_secret = settings.STRIPE_WEBHOOK_SECRET
         
-        # Log the payment
-        Payment.objects.create(
-            user=user,
-            amount=amount,
-            reference=reference,
-            status='success'
-        )
+        try:
+            event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
+        except ValueError as e:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+        except stripe.error.SignatureVerificationError as e:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
 
-        return HttpResponse(status=200)
-
-    # You can handle other event types here (e.g., charge.failed)
-
-    return HttpResponse(status=200)
+        # Handle the event
+        if event['type'] == 'invoice.payment_succeeded':
+            # Handle successful payment logic
+            pass
+        elif event['type'] == 'customer.subscription.deleted':
+            # Handle subscription cancellation
+            pass
+        
+        return Response(status=status.HTTP_200_OK)

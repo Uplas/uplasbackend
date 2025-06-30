@@ -1,43 +1,60 @@
-# courses/views.py
-from rest_framework import generics, permissions, filters
+
+# apps/courses/views.py
+from rest_framework import viewsets, generics, permissions
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
-from .models import Course, Lesson, TeamMember
-from .serializers import CourseListSerializer, CourseDetailSerializer, LessonContentSerializer, TeamMemberSerializer
-from payments.models import Subscription
+from rest_framework.filters import SearchFilter, OrderingFilter
 
-class CourseListView(generics.ListAPIView):
-    queryset = Course.objects.all()
-    serializer_class = CourseListSerializer
-    permission_classes = [permissions.AllowAny]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ['category__slug', 'difficulty']
-    search_fields = ['title', 'short_description', 'long_description']
+from .models import Category, Course, Module, Topic
+from .serializers import CategorySerializer, CourseListSerializer, CourseDetailSerializer, ModuleDetailSerializer, TopicDetailSerializer
+from apps.payments.models import UserSubscription # CORRECTED IMPORT
+from .permissions import IsInstructorOrReadOnly, IsEnrolled
 
-class CourseDetailView(generics.RetrieveAPIView):
-    queryset = Course.objects.all()
-    serializer_class = CourseDetailSerializer
+class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Category.objects.all()
+    serializer_class = CategorySerializer
     permission_classes = [permissions.AllowAny]
     lookup_field = 'slug'
 
-class LessonContentView(generics.RetrieveAPIView):
-    queryset = Lesson.objects.all()
-    serializer_class = LessonContentSerializer
-    permission_classes = [permissions.IsAuthenticated]
+class CourseViewSet(viewsets.ModelViewSet):
+    queryset = Course.objects.filter(is_published=True)
+    permission_classes = [IsInstructorOrReadOnly]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['category__slug', 'level']
+    search_fields = ['title', 'short_description', 'long_description']
+    ordering_fields = ['title', 'price', 'created_at', 'average_rating']
+    lookup_field = 'slug'
 
-    def retrieve(self, request, *args, **kwargs):
-        # Check if the user has an active subscription
-        has_active_subscription = Subscription.objects.filter(
-            user=request.user, 
-            is_active=True
-        ).exists()
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return CourseListSerializer
+        return CourseDetailSerializer
 
-        if not has_active_subscription:
-            return Response({"detail": "You do not have an active subscription to view this content."}, status=403)
-        
-        return super().retrieve(request, *args, **kwargs)
+    def perform_create(self, serializer):
+        serializer.save(instructor=self.request.user)
 
-class TeamMemberListView(generics.ListAPIView):
-    queryset = TeamMember.objects.all()
-    serializer_class = TeamMemberSerializer
-    permission_classes = [permissions.AllowAny]
+class ModuleViewSet(viewsets.ModelViewSet):
+    serializer_class = ModuleDetailSerializer
+    permission_classes = [IsInstructorOrReadOnly]
+
+    def get_queryset(self):
+        course_slug = self.kwargs.get('course_slug')
+        return Module.objects.filter(course__slug=course_slug).order_by('order')
+
+    def perform_create(self, serializer):
+        course = Course.objects.get(slug=self.kwargs.get('course_slug'))
+        serializer.save(course=course)
+
+class TopicViewSet(viewsets.ModelViewSet):
+    serializer_class = TopicDetailSerializer
+    permission_classes = [IsEnrolled] # Users must be enrolled to view topics
+    lookup_field = 'slug'
+
+    def get_queryset(self):
+        module_id = self.kwargs.get('module_pk')
+        return Topic.objects.filter(module_id=module_id).order_by('order')
+
+    def perform_create(self, serializer):
+        module = Module.objects.get(pk=self.kwargs.get('module_pk'))
+        serializer.save(module=module)
